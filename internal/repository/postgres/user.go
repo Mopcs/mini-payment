@@ -5,17 +5,16 @@ import (
 	"strings"
 
 	"github.com/google/uuid"
-	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/Mopcs/mini-payment-system/internal/domain"
 )
 
 type UserRepository struct {
-	pool *pgxpool.Pool
+	db DBTX
 }
 
-func NewUserRepository(pool *pgxpool.Pool) *UserRepository {
-	return &UserRepository{pool: pool}
+func NewUserRepository(db DBTX) *UserRepository {
+	return &UserRepository{db: db}
 }
 
 func (r *UserRepository) Create(ctx context.Context, user *domain.User) error {
@@ -27,7 +26,7 @@ func (r *UserRepository) Create(ctx context.Context, user *domain.User) error {
 	}
 	user.Email = normalizeEmail(user.Email)
 
-	err := r.pool.QueryRow(ctx, `
+	err := r.db.QueryRow(ctx, `
 		INSERT INTO users (id, email, password_hash)
 		VALUES ($1, $2, $3)
 		RETURNING id, email, password_hash, created_at, updated_at`,
@@ -38,7 +37,7 @@ func (r *UserRepository) Create(ctx context.Context, user *domain.User) error {
 
 func (r *UserRepository) GetByID(ctx context.Context, id uuid.UUID) (*domain.User, error) {
 	user := new(domain.User)
-	err := r.pool.QueryRow(ctx, `
+	err := r.db.QueryRow(ctx, `
 		SELECT id, email, password_hash, created_at, updated_at
 		FROM users
 		WHERE id = $1`, id,
@@ -51,7 +50,7 @@ func (r *UserRepository) GetByID(ctx context.Context, id uuid.UUID) (*domain.Use
 
 func (r *UserRepository) GetByEmail(ctx context.Context, email string) (*domain.User, error) {
 	user := new(domain.User)
-	err := r.pool.QueryRow(ctx, `
+	err := r.db.QueryRow(ctx, `
 		SELECT id, email, password_hash, created_at, updated_at
 		FROM users
 		WHERE email = $1`, normalizeEmail(email),

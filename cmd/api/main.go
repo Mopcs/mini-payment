@@ -14,6 +14,7 @@ import (
 	"github.com/Mopcs/mini-payment-system/internal/config"
 	"github.com/Mopcs/mini-payment-system/internal/infrastructure/postgres"
 	redisinfra "github.com/Mopcs/mini-payment-system/internal/infrastructure/redis"
+	authservice "github.com/Mopcs/mini-payment-system/internal/service/auth"
 	httpserver "github.com/Mopcs/mini-payment-system/internal/transport/http"
 )
 
@@ -42,6 +43,11 @@ func run(cfg config.Config, logger *slog.Logger) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	tokens, err := authservice.NewTokenManager(cfg.JWTSecret, cfg.JWTIssuer, cfg.JWTAccessTokenTTL)
+	if err != nil {
+		return fmt.Errorf("initialize JWT signing: %w", err)
+	}
+
 	pool, err := postgres.NewPool(ctx, cfg)
 	if err != nil {
 		return fmt.Errorf("create PostgreSQL pool: %w", err)
@@ -55,7 +61,8 @@ func run(cfg config.Config, logger *slog.Logger) error {
 		}
 	}()
 
-	server := httpserver.NewServer(cfg.AppAddr, pool, redisinfra.NewPinger(redisClient), logger)
+	service := authservice.NewService(pool, tokens)
+	server := httpserver.NewServer(cfg.AppAddr, pool, redisinfra.NewPinger(redisClient), service, logger)
 	serverErrors := make(chan error, 1)
 	go func() {
 		logger.Info("HTTP server started", slog.String("address", cfg.AppAddr))
@@ -85,4 +92,3 @@ func run(cfg config.Config, logger *slog.Logger) error {
 	logger.Info("HTTP server stopped")
 	return nil
 }
-

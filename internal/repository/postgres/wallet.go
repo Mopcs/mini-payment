@@ -5,17 +5,16 @@ import (
 	"strings"
 
 	"github.com/google/uuid"
-	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/Mopcs/mini-payment-system/internal/domain"
 )
 
 type WalletRepository struct {
-	pool *pgxpool.Pool
+	db DBTX
 }
 
-func NewWalletRepository(pool *pgxpool.Pool) *WalletRepository {
-	return &WalletRepository{pool: pool}
+func NewWalletRepository(db DBTX) *WalletRepository {
+	return &WalletRepository{db: db}
 }
 
 func (r *WalletRepository) Create(ctx context.Context, wallet *domain.Wallet) error {
@@ -27,7 +26,7 @@ func (r *WalletRepository) Create(ctx context.Context, wallet *domain.Wallet) er
 	}
 	wallet.Currency = normalizeCurrency(wallet.Currency)
 
-	err := r.pool.QueryRow(ctx, `
+	err := r.db.QueryRow(ctx, `
 		INSERT INTO wallets (id, user_id, currency, balance)
 		VALUES ($1, $2, $3, $4)
 		RETURNING id, user_id, currency, balance, created_at, updated_at`,
@@ -38,7 +37,7 @@ func (r *WalletRepository) Create(ctx context.Context, wallet *domain.Wallet) er
 
 func (r *WalletRepository) GetByID(ctx context.Context, id uuid.UUID) (*domain.Wallet, error) {
 	wallet := new(domain.Wallet)
-	err := r.pool.QueryRow(ctx, `
+	err := r.db.QueryRow(ctx, `
 		SELECT id, user_id, currency, balance, created_at, updated_at
 		FROM wallets
 		WHERE id = $1`, id,
@@ -50,7 +49,7 @@ func (r *WalletRepository) GetByID(ctx context.Context, id uuid.UUID) (*domain.W
 }
 
 func (r *WalletRepository) GetByUserID(ctx context.Context, userID uuid.UUID) ([]domain.Wallet, error) {
-	rows, err := r.pool.Query(ctx, `
+	rows, err := r.db.Query(ctx, `
 		SELECT id, user_id, currency, balance, created_at, updated_at
 		FROM wallets
 		WHERE user_id = $1
@@ -76,7 +75,7 @@ func (r *WalletRepository) GetByUserID(ctx context.Context, userID uuid.UUID) ([
 
 func (r *WalletRepository) GetByUserIDAndCurrency(ctx context.Context, userID uuid.UUID, currency string) (*domain.Wallet, error) {
 	wallet := new(domain.Wallet)
-	err := r.pool.QueryRow(ctx, `
+	err := r.db.QueryRow(ctx, `
 		SELECT id, user_id, currency, balance, created_at, updated_at
 		FROM wallets
 		WHERE user_id = $1 AND currency = $2`, userID, normalizeCurrency(currency),

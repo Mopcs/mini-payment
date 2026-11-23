@@ -35,9 +35,20 @@ Both services publish ports only on `127.0.0.1`. Their data is stored in Docker 
 | `REDIS_PORT` | Published Redis port | `6379` |
 | `REDIS_PASSWORD` | Local Redis password | `local_dev_redis_password` |
 | `LOG_LEVEL` | JSON log level (`debug`, `info`, `warn`, or `error`) | `info` |
+| `JWT_SECRET` | HMAC signing key, at least 32 bytes | replace the example placeholder |
+| `JWT_ISSUER` | JWT issuer claim | `mini-payment-system` |
+| `JWT_ACCESS_TOKEN_TTL` | Access token lifetime, from 1 second to 24 hours | `15m` |
 
 Compose requires both passwords from `.env`; the example values are for local development only.
 Environment variables already set in the shell take precedence over values loaded from `.env`.
+Replace the `JWT_SECRET` placeholder in `.env` with a cryptographically random value before running the API; never commit `.env` or use the example value outside local development.
+
+## Registration and login
+
+- `POST /api/v1/auth/register` creates a user and an initial zero-balance USD wallet in one PostgreSQL transaction.
+- `POST /api/v1/auth/login` verifies the email and password and returns the same generic error for either invalid value.
+
+Passwords must contain at least 12 Unicode characters and at most 1024 bytes. They are stored as Argon2id hashes using 64 MiB memory, 3 iterations, 2 threads, a random 16-byte salt, and a 32-byte output. Access tokens use HS256 and contain only `sub` (the user UUID), `iat`, `exp`, and `iss`; no email or password data is included.
 
 ## Make commands
 

@@ -1,0 +1,134 @@
+package auth
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"net/mail"
+	"strings"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/Mopcs/mini-payment-system/internal/domain"
+	"github.com/Mopcs/mini-payment-system/internal/repository/postgres"
+)
+
+const maxEmailBytes = 255
+
+type UserInfo struct {
+	ID    uuid.UUID `json:"id"`
+	Email string    `json:"email"`
+}
+
+type Result struct {
+	User        UserInfo
+	AccessToken string
+	ExpiresIn   int64
+}
+
+type Service struct {
+	pool   *pgxpool.Pool
+	tokens *TokenManager
+}
+
+func NewService(pool *pgxpool.Pool, tokens *TokenManager) *Service {
+	return &Service{pool: pool, tokens: tokens}
+}
+
+func (s *Service) Register(ctx context.Context, email, password string) (result Result, returnedErr error) {
+	normalizedEmail, err := normalizeAndValidateEmail(email)
+	if err != nil {
+		return Result{}, err
+	}
+	if !validPasswordLength(password) {
+		return Result{}, ErrInvalidPassword
+	}
+	passwordHash, err := HashPassword(password)
+	if err != nil {
+		return Result{}, fmt.Errorf("hash registration password: %w", err)
+	}
+
+	user := &domain.User{ID: uuid.New(), Email: normalizedEmail, PasswordHash: passwordHash}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return Result{}, fmt.Errorf("begin registration transaction: %w", err)
+	}
+	committed := false
+	defer func() {
+		if committed {
+			return
+		}
+		rollbackCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		defer cancel()
+		if rollbackErr := tx.Rollback(rollbackCtx); rollbackErr != nil && !errors.Is(rollbackErr, pgx.ErrTxClosed) {
+			returnedErr = errors.Join(returnedErr, fmt.Errorf("rollback registration transaction: %w", rollbackErr))
+		}
+	}()
+
+	userRepo := postgres.NewUserRepository(tx)
+	if err := userRepo.Create(ctx, user); err != nil {
+		if errors.Is(err, postgres.ErrEmailAlreadyExists) {
+			return Result{}, ErrEmailAlreadyRegistered
+		}
+		return Result{}, fmt.Errorf("create registration user: %w", err)
+	}
+	wallet := &domain.Wallet{ID: uuid.New(), UserID: user.ID, Currency: "USD", Balance: 0}
+	if err := postgres.NewWalletRepository(tx).Create(ctx, wallet); err != nil {
+		return Result{}, fmt.Errorf("create initial wallet: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return Result{}, fmt.Errorf("commit registration transaction: %w", err)
+	}
+	committed = true
+
+	return s.issueResult(user)
+}
+
+func (s *Service) Login(ctx context.Context, email, password string) (Result, error) {
+	normalizedEmail, err := normalizeAndValidateEmail(email)
+	if err != nil || !validPasswordLength(password) {
+		return Result{}, ErrInvalidCredentials
+	}
+	user, err := postgres.NewUserRepository(s.pool).GetByEmail(ctx, normalizedEmail)
+	if errors.Is(err, postgres.ErrNotFound) {
+		return Result{}, ErrInvalidCredentials
+	}
+	if err != nil {
+		return Result{}, fmt.Errorf("load login user: %w", err)
+	}
+	valid, err := VerifyPassword(password, user.PasswordHash)
+	if err != nil {
+		return Result{}, fmt.Errorf("verify stored password hash: %w", err)
+	}
+	if !valid {
+		return Result{}, ErrInvalidCredentials
+	}
+	return s.issueResult(user)
+}
+
+func (s *Service) issueResult(user *domain.User) (Result, error) {
+	token, err := s.tokens.Generate(user.ID)
+	if err != nil {
+		return Result{}, fmt.Errorf("generate access token: %w", err)
+	}
+	return Result{
+		User:        UserInfo{ID: user.ID, Email: user.Email},
+		AccessToken: token,
+		ExpiresIn:   s.tokens.ExpiresIn(),
+	}, nil
+}
+
+func normalizeAndValidateEmail(email string) (string, error) {
+	normalized := strings.ToLower(strings.TrimSpace(email))
+	if len(normalized) == 0 || len(normalized) > maxEmailBytes {
+		return "", ErrInvalidEmail
+	}
+	parsed, err := mail.ParseAddress(normalized)
+	if err != nil || parsed.Address != normalized {
+		return "", ErrInvalidEmail
+	}
+	return normalized, nil
+}

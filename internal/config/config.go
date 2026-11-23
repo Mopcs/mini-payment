@@ -5,21 +5,26 @@ import (
 	"fmt"
 	"os"
 	"strconv"
+	"strings"
+	"time"
 
 	"github.com/joho/godotenv"
 )
 
 type Config struct {
-	AppAddr        string
-	PostgresHost   string
-	PostgresPort   uint16
-	PostgresDB     string
-	PostgresUser   string
-	PostgresPass   string
-	RedisHost      string
-	RedisPort      uint16
-	RedisPassword  string
-	LogLevel       string
+	AppAddr           string
+	PostgresHost      string
+	PostgresPort      uint16
+	PostgresDB        string
+	PostgresUser      string
+	PostgresPass      string
+	RedisHost         string
+	RedisPort         uint16
+	RedisPassword     string
+	LogLevel          string
+	JWTSecret         string
+	JWTIssuer         string
+	JWTAccessTokenTTL time.Duration
 }
 
 func Load() (Config, error) {
@@ -49,18 +54,36 @@ func Load() (Config, error) {
 	if logLevel != "debug" && logLevel != "info" && logLevel != "warn" && logLevel != "error" {
 		return Config{}, fmt.Errorf("LOG_LEVEL must be debug, info, warn, or error")
 	}
+	jwtSecret, err := requiredEnv("JWT_SECRET")
+	if err != nil {
+		return Config{}, err
+	}
+	if len([]byte(jwtSecret)) < 32 {
+		return Config{}, errors.New("JWT_SECRET must be at least 32 bytes")
+	}
+	jwtIssuer := strings.TrimSpace(envOrDefault("JWT_ISSUER", "mini-payment-system"))
+	if jwtIssuer == "" {
+		return Config{}, errors.New("JWT_ISSUER must not be empty")
+	}
+	jwtTTL, err := time.ParseDuration(envOrDefault("JWT_ACCESS_TOKEN_TTL", "15m"))
+	if err != nil || jwtTTL < time.Second || jwtTTL > 24*time.Hour {
+		return Config{}, errors.New("JWT_ACCESS_TOKEN_TTL must be between 1s and 24h")
+	}
 
 	return Config{
-		AppAddr:       envOrDefault("APP_ADDR", ":8080"),
-		PostgresHost:  envOrDefault("POSTGRES_HOST", "localhost"),
-		PostgresPort:  postgresPort,
-		PostgresDB:    envOrDefault("POSTGRES_DB", "payment_db"),
-		PostgresUser:  envOrDefault("POSTGRES_USER", "payment_user"),
-		PostgresPass:  postgresPassword,
-		RedisHost:     envOrDefault("REDIS_HOST", "localhost"),
-		RedisPort:     redisPort,
-		RedisPassword: redisPassword,
-		LogLevel:      logLevel,
+		AppAddr:           envOrDefault("APP_ADDR", ":8080"),
+		PostgresHost:      envOrDefault("POSTGRES_HOST", "localhost"),
+		PostgresPort:      postgresPort,
+		PostgresDB:        envOrDefault("POSTGRES_DB", "payment_db"),
+		PostgresUser:      envOrDefault("POSTGRES_USER", "payment_user"),
+		PostgresPass:      postgresPassword,
+		RedisHost:         envOrDefault("REDIS_HOST", "localhost"),
+		RedisPort:         redisPort,
+		RedisPassword:     redisPassword,
+		LogLevel:          logLevel,
+		JWTSecret:         jwtSecret,
+		JWTIssuer:         jwtIssuer,
+		JWTAccessTokenTTL: jwtTTL,
 	}, nil
 }
 
