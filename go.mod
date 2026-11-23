@@ -7,9 +7,9 @@ require (
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/jackc/pgpassfile v1.0.0 // indirect
 	github.com/jackc/pgservicefile v0.0.0-20240606120523-5a60cdf6a761 // indirect
-	github.com/jackc/pgx/v5 v5.13.0 // indirect
-	github.com/joho/godotenv v1.5.1 // indirect
-	github.com/redis/go-redis/v9 v9.23.0 // indirect
+	github.com/jackc/pgx/v5 v5.13.0
+	github.com/joho/godotenv v1.5.1
+	github.com/redis/go-redis/v9 v9.23.0
 	go.uber.org/atomic v1.12.0 // indirect
 	golang.org/x/crypto v0.59.0 // indirect
 	golang.org/x/sys v0.50.0 // indirect
