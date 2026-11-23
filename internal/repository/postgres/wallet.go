@@ -48,6 +48,19 @@ func (r *WalletRepository) GetByID(ctx context.Context, id uuid.UUID) (*domain.W
 	return wallet, nil
 }
 
+func (r *WalletRepository) GetByIDAndUserID(ctx context.Context, id, userID uuid.UUID) (*domain.Wallet, error) {
+	wallet := new(domain.Wallet)
+	err := r.db.QueryRow(ctx, `
+		SELECT id, user_id, currency, balance, created_at, updated_at
+		FROM wallets
+		WHERE id = $1 AND user_id = $2`, id, userID,
+	).Scan(&wallet.ID, &wallet.UserID, &wallet.Currency, &wallet.Balance, &wallet.CreatedAt, &wallet.UpdatedAt)
+	if err != nil {
+		return nil, translateError("get wallet by id and user", err)
+	}
+	return wallet, nil
+}
+
 func (r *WalletRepository) GetByUserID(ctx context.Context, userID uuid.UUID) ([]domain.Wallet, error) {
 	rows, err := r.db.Query(ctx, `
 		SELECT id, user_id, currency, balance, created_at, updated_at

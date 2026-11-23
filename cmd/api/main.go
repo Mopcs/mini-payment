@@ -15,6 +15,7 @@ import (
 	"github.com/Mopcs/mini-payment-system/internal/infrastructure/postgres"
 	redisinfra "github.com/Mopcs/mini-payment-system/internal/infrastructure/redis"
 	authservice "github.com/Mopcs/mini-payment-system/internal/service/auth"
+	walletservice "github.com/Mopcs/mini-payment-system/internal/service/wallet"
 	httpserver "github.com/Mopcs/mini-payment-system/internal/transport/http"
 )
 
@@ -62,7 +63,8 @@ func run(cfg config.Config, logger *slog.Logger) error {
 	}()
 
 	service := authservice.NewService(pool, tokens)
-	server := httpserver.NewServer(cfg.AppAddr, pool, redisinfra.NewPinger(redisClient), service, logger)
+	wallets := walletservice.NewService(pool)
+	server := httpserver.NewServer(cfg.AppAddr, pool, redisinfra.NewPinger(redisClient), service, wallets, tokens, logger)
 	serverErrors := make(chan error, 1)
 	go func() {
 		logger.Info("HTTP server started", slog.String("address", cfg.AppAddr))
