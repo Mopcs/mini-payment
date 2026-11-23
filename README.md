@@ -48,3 +48,13 @@ Environment variables already set in the shell take precedence over values loade
 - `make restart` — restart the services.
 - `make clean` — remove containers and data volumes. This permanently deletes PostgreSQL and Redis data.
 - `make config` — validate and print the Compose configuration.
+
+## Database migrations
+
+The migration command reads PostgreSQL settings from `.env` (or the process environment) and connects to the local Compose service. Start PostgreSQL with `make up`, then apply all pending migrations with `make migrate-up`.
+
+- `make migrate-down` — roll back one migration.
+- `make migrate-version` — show the current version and whether the migration state is dirty.
+- `make migrate-force VERSION=2` — example only: set migration bookkeeping to the manually verified version while recovering a dirty state. This does not run SQL; first inspect the database and manually repair or complete the interrupted migration. The command refuses to run unless the state is dirty.
+
+Migration files live in `migrations/` and are not run automatically when the API starts. Wallet balances use integer amounts in each currency's smallest unit: cents for USD/EUR and whole yen for JPY. Deleting a user with a wallet is restricted by the foreign key.
