@@ -1,0 +1,24 @@
+.env
+
+# Go build and test output
+/bin/
+/build/
+*.exe
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+coverage.out
+coverage.html
+
+# Temporary files
+*.tmp
+*.temp
+*.swp
+*~
+
+# IDE and editor settings
+.idea/
+.vscode/
+*.iml
