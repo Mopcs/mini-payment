@@ -24,6 +24,7 @@ type WalletService interface {
 	List(context.Context, uuid.UUID) ([]domain.Wallet, error)
 	Get(context.Context, uuid.UUID, uuid.UUID) (*domain.Wallet, error)
 	Create(context.Context, uuid.UUID, string) (*domain.Wallet, error)
+	Deposit(context.Context, uuid.UUID, uuid.UUID, int64, string, string) (domain.Deposit, bool, error)
 }
 
 type Wallet struct {
@@ -32,6 +33,11 @@ type Wallet struct {
 }
 
 type createWalletRequest struct {
+	Currency string `json:"currency"`
+}
+
+type depositRequest struct {
+	Amount   int64  `json:"amount"`
 	Currency string `json:"currency"`
 }
 
@@ -46,6 +52,15 @@ type walletsResponse struct {
 	Wallets []walletResponse `json:"wallets"`
 }
 
+type depositResponse struct {
+	TransactionID uuid.UUID `json:"transaction_id"`
+	WalletID      uuid.UUID `json:"wallet_id"`
+	Amount        int64     `json:"amount"`
+	Currency      string    `json:"currency"`
+	Balance       int64     `json:"balance"`
+	CreatedAt     time.Time `json:"created_at"`
+}
+
 func NewWallet(service WalletService, logger *slog.Logger) *Wallet {
 	return &Wallet{service: service, logger: logger}
 }
@@ -54,6 +69,7 @@ func (h *Wallet) Register(mux *http.ServeMux, tokens middleware.TokenValidator) 
 	mux.Handle("GET /api/v1/wallets", middleware.Authenticate(tokens, http.HandlerFunc(h.list)))
 	mux.Handle("GET /api/v1/wallets/{id}", middleware.Authenticate(tokens, http.HandlerFunc(h.get)))
 	mux.Handle("POST /api/v1/wallets", middleware.Authenticate(tokens, http.HandlerFunc(h.create)))
+	mux.Handle("POST /api/v1/wallets/{id}/deposits", middleware.Authenticate(tokens, http.HandlerFunc(h.deposit)))
 }
 
 func (h *Wallet) list(w http.ResponseWriter, r *http.Request) {
@@ -127,7 +143,58 @@ func (h *Wallet) create(w http.ResponseWriter, r *http.Request) {
 	writeAuthJSON(w, http.StatusCreated, toWalletResponse(*item))
 }
 
-func decodeWalletRequest(w http.ResponseWriter, r *http.Request, target *createWalletRequest) *requestDecodeError {
+func (h *Wallet) deposit(w http.ResponseWriter, r *http.Request) {
+	userID, ok := middleware.UserID(r.Context())
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "unauthorized", "authentication required")
+		return
+	}
+	walletID, err := uuid.Parse(r.PathValue("id"))
+	if err != nil || walletID == uuid.Nil {
+		writeError(w, http.StatusNotFound, "wallet_not_found", "wallet was not found")
+		return
+	}
+	var request depositRequest
+	if err := decodeWalletRequest(w, r, &request); err != nil {
+		writeError(w, err.status, err.code, err.text)
+		return
+	}
+	result, replay, err := h.service.Deposit(r.Context(), userID, walletID, request.Amount, request.Currency, r.Header.Get("Idempotency-Key"))
+	switch {
+	case errors.Is(err, walletservice.ErrInvalidAmount):
+		writeError(w, http.StatusBadRequest, "invalid_amount", "amount must be greater than zero")
+	case errors.Is(err, walletservice.ErrInvalidCurrency):
+		writeError(w, http.StatusBadRequest, "invalid_currency", "currency must be USD, EUR, or JPY")
+	case errors.Is(err, walletservice.ErrInvalidIdempotencyKey):
+		writeError(w, http.StatusBadRequest, "invalid_idempotency_key", "a valid Idempotency-Key header is required")
+	case errors.Is(err, walletservice.ErrCurrencyMismatch):
+		writeError(w, http.StatusBadRequest, "currency_mismatch", "currency does not match wallet")
+	case errors.Is(err, walletservice.ErrNotFound):
+		writeError(w, http.StatusNotFound, "wallet_not_found", "wallet was not found")
+	case errors.Is(err, walletservice.ErrIdempotencyConflict):
+		writeError(w, http.StatusConflict, "idempotency_conflict", "idempotency key was used for a different request")
+	case errors.Is(err, walletservice.ErrBalanceLimit):
+		writeError(w, http.StatusConflict, "balance_limit", "deposit would exceed the wallet balance limit")
+	case err != nil:
+		h.logger.Error("deposit failed", slog.Any("error", err))
+		writeError(w, http.StatusInternalServerError, "internal_error", "request could not be completed")
+	default:
+		if replay {
+			w.Header().Set("Idempotent-Replay", "true")
+		}
+		w.Header().Set("Cache-Control", "no-store")
+		writeAuthJSON(w, http.StatusCreated, depositResponse{
+			TransactionID: result.TransactionID,
+			WalletID:      result.WalletID,
+			Amount:        result.Amount,
+			Currency:      result.Currency,
+			Balance:       result.BalanceAfter,
+			CreatedAt:     result.CreatedAt,
+		})
+	}
+}
+
+func decodeWalletRequest(w http.ResponseWriter, r *http.Request, target any) *requestDecodeError {
 	contentType, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
 	if err != nil || contentType != "application/json" {
 		return &requestDecodeError{status: http.StatusUnsupportedMediaType, code: "unsupported_media_type", text: "content type must be application/json"}

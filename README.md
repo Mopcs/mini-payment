@@ -69,3 +69,11 @@ The migration command reads PostgreSQL settings from `.env` (or the process envi
 - `make migrate-force VERSION=2` — example only: set migration bookkeeping to the manually verified version while recovering a dirty state. This does not run SQL; first inspect the database and manually repair or complete the interrupted migration. The command refuses to run unless the state is dirty.
 
 Migration files live in `migrations/` and are not run automatically when the API starts. Wallet balances use integer amounts in each currency's smallest unit: cents for USD/EUR and whole yen for JPY. Deleting a user with a wallet is restricted by the foreign key.
+
+## Simulated deposits and ledger
+
+`POST /api/v1/wallets/{id}/deposits` is a **development/demo simulation only**. It creates funds in the local system; it does not move money or contact a payment provider. Do not expose this endpoint as a real-money deposit endpoint.
+
+Send a positive integer `amount` in the currency's smallest unit and a matching `currency` (`USD`, `EUR`, or `JPY`), plus a unique `Idempotency-Key` header. Repeating the same authenticated user's key with the same wallet, amount, and currency returns the original result without crediting the wallet again. Reusing that key with different request parameters returns `409 Conflict`. Keys are stored with ledger transactions in PostgreSQL.
+
+Each wallet has a ledger account, created by the database when the wallet is inserted; existing wallets receive accounts when migration 3 is applied. The corresponding system funding accounts are seeded for each supported currency. Deposits update the wallet and create equal positive wallet and negative funding entries in one transaction. Ledger entries are append-only; represent any correction with a compensating transaction rather than editing history. Migration 3's down migration refuses to remove the ledger schema while ledger entries exist.

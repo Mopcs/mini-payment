@@ -10,16 +10,21 @@ import (
 
 // These errors let callers handle repository outcomes without depending on PostgreSQL details.
 var (
-	ErrNotFound            = errors.New("record not found")
-	ErrInvalidInput        = errors.New("invalid input")
-	ErrUniqueViolation     = errors.New("unique constraint violation")
-	ErrEmailAlreadyExists  = errors.New("email already exists")
-	ErrWalletAlreadyExists = errors.New("wallet already exists")
-	ErrForeignKeyViolation = errors.New("referenced record does not exist")
-	ErrCheckViolation      = errors.New("value violates a constraint")
-	ErrInvalidEmail        = errors.New("email must be lowercase and trimmed")
-	ErrInvalidBalance      = errors.New("wallet balance cannot be negative")
-	ErrUnsupportedCurrency = errors.New("currency is not supported")
+	ErrNotFound                = errors.New("record not found")
+	ErrInvalidInput            = errors.New("invalid input")
+	ErrUniqueViolation         = errors.New("unique constraint violation")
+	ErrEmailAlreadyExists      = errors.New("email already exists")
+	ErrWalletAlreadyExists     = errors.New("wallet already exists")
+	ErrForeignKeyViolation     = errors.New("referenced record does not exist")
+	ErrCheckViolation          = errors.New("value violates a constraint")
+	ErrInvalidEmail            = errors.New("email must be lowercase and trimmed")
+	ErrInvalidBalance          = errors.New("wallet balance cannot be negative")
+	ErrUnsupportedCurrency     = errors.New("currency is not supported")
+	ErrIdempotencyConflict     = errors.New("idempotency key was reused with a different request")
+	ErrDepositWalletNotFound   = errors.New("deposit wallet not found")
+	ErrDepositCurrencyMismatch = errors.New("deposit currency does not match wallet")
+	ErrLedgerAccountMissing    = errors.New("ledger account is missing")
+	ErrBalanceOverflow         = errors.New("wallet balance would overflow")
 )
 
 type databaseOperationError struct {
