@@ -365,11 +365,18 @@ func cleanupDepositData(t *testing.T, pool *pgxpool.Pool, userID uuid.UUID) {
 		t.Errorf("disable append-only trigger for isolated test cleanup: %v", err)
 		return
 	}
-	if _, err := tx.Exec(context.Background(), `DELETE FROM ledger_entries WHERE transaction_id IN (SELECT id FROM ledger_transactions WHERE user_id = $1)`, userID); err != nil {
+	if _, err := tx.Exec(context.Background(), `DELETE FROM ledger_entries WHERE transaction_id IN (
+		SELECT id FROM ledger_transactions
+		WHERE user_id = $1
+		   OR wallet_id IN (SELECT id FROM wallets WHERE user_id = $1)
+		   OR destination_wallet_id IN (SELECT id FROM wallets WHERE user_id = $1))`, userID); err != nil {
 		t.Errorf("delete test ledger entries: %v", err)
 		return
 	}
-	if _, err := tx.Exec(context.Background(), `DELETE FROM ledger_transactions WHERE user_id = $1`, userID); err != nil {
+	if _, err := tx.Exec(context.Background(), `DELETE FROM ledger_transactions
+		WHERE user_id = $1
+		   OR wallet_id IN (SELECT id FROM wallets WHERE user_id = $1)
+		   OR destination_wallet_id IN (SELECT id FROM wallets WHERE user_id = $1)`, userID); err != nil {
 		t.Errorf("delete test ledger transactions: %v", err)
 		return
 	}

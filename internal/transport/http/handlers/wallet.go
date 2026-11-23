@@ -195,6 +195,10 @@ func (h *Wallet) deposit(w http.ResponseWriter, r *http.Request) {
 }
 
 func decodeWalletRequest(w http.ResponseWriter, r *http.Request, target any) *requestDecodeError {
+	return decodeJSONRequest(w, r, target, "wallet")
+}
+
+func decodeJSONRequest(w http.ResponseWriter, r *http.Request, target any, requestName string) *requestDecodeError {
 	contentType, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
 	if err != nil || contentType != "application/json" {
 		return &requestDecodeError{status: http.StatusUnsupportedMediaType, code: "unsupported_media_type", text: "content type must be application/json"}
@@ -206,7 +210,7 @@ func decodeWalletRequest(w http.ResponseWriter, r *http.Request, target any) *re
 		if errors.As(err, &maxBytesErr) {
 			return &requestDecodeError{status: http.StatusRequestEntityTooLarge, code: "request_too_large", text: "request body is too large"}
 		}
-		return &requestDecodeError{status: http.StatusBadRequest, code: "invalid_request", text: "request body must contain valid wallet JSON"}
+		return &requestDecodeError{status: http.StatusBadRequest, code: "invalid_request", text: "request body must contain valid " + requestName + " JSON"}
 	}
 	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
 		return &requestDecodeError{status: http.StatusBadRequest, code: "invalid_request", text: "request body must contain exactly one JSON value"}

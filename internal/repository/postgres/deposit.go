@@ -1,7 +1,6 @@
 package postgres
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -42,37 +41,24 @@ func (r *DepositRepository) Create(ctx context.Context, userID, walletID uuid.UU
 	}()
 
 	transactionID := uuid.New()
-	var createdAt time.Time
-	err = tx.QueryRow(ctx, `
-		INSERT INTO ledger_transactions
-			(id, transaction_type, user_id, idempotency_key, request_hash, wallet_id, currency, amount)
-		VALUES ($1, 'deposit', $2, $3, $4, $5, $6, $7)
-		ON CONFLICT (user_id, idempotency_key) DO NOTHING
-		RETURNING id, created_at`,
-		transactionID, userID, key, requestHash, walletID, currency, amount,
-	).Scan(&transactionID, &createdAt)
-	if errors.Is(err, pgx.ErrNoRows) {
+	transactionID, createdAt, replay, err := claimLedgerTransaction(ctx, tx, userID, transactionID, "deposit", key, requestHash, walletID, nil, currency, amount)
+	if err != nil {
+		return domain.Deposit{}, false, fmt.Errorf("claim deposit idempotency key: %w", err)
+	}
+	if replay {
 		var existing domain.Deposit
-		var existingHash []byte
 		err = tx.QueryRow(ctx, `
-			SELECT id, wallet_id, amount, currency, balance_after, created_at, request_hash
-			FROM ledger_transactions
-			WHERE user_id = $1 AND idempotency_key = $2`, userID, key,
-		).Scan(&existing.TransactionID, &existing.WalletID, &existing.Amount, &existing.Currency, &existing.BalanceAfter, &existing.CreatedAt, &existingHash)
+			SELECT id, wallet_id, amount, currency, balance_after, created_at
+			FROM ledger_transactions WHERE id = $1`, transactionID,
+		).Scan(&existing.TransactionID, &existing.WalletID, &existing.Amount, &existing.Currency, &existing.BalanceAfter, &existing.CreatedAt)
 		if err != nil {
 			return domain.Deposit{}, false, translateError("load idempotent deposit", err)
-		}
-		if !bytes.Equal(existingHash, requestHash) {
-			return domain.Deposit{}, false, ErrIdempotencyConflict
 		}
 		if err := tx.Commit(ctx); err != nil {
 			return domain.Deposit{}, false, fmt.Errorf("commit idempotent deposit lookup: %w", err)
 		}
 		committed = true
 		return existing, true, nil
-	}
-	if err != nil {
-		return domain.Deposit{}, false, translateError("claim deposit idempotency key", err)
 	}
 
 	var walletCurrency string
