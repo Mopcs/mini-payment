@@ -16,8 +16,35 @@ func TestLoadDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load() error = %v", err)
 	}
-	if cfg.AppAddr != ":8080" || cfg.PostgresHost != "localhost" || cfg.PostgresPort != 5432 || cfg.PostgresDB != "payment_db" || cfg.PostgresUser != "payment_user" || cfg.RedisHost != "localhost" || cfg.RedisPort != 6379 || cfg.LogLevel != "info" || cfg.JWTIssuer != "mini-payment-system" || cfg.JWTAccessTokenTTL != 15*time.Minute {
+	if cfg.AppAddr != ":8080" || cfg.PostgresHost != "localhost" || cfg.PostgresPort != 5432 || cfg.PostgresDB != "payment_db" || cfg.PostgresUser != "payment_user" || cfg.RedisHost != "localhost" || cfg.RedisPort != 6379 || cfg.LogLevel != "info" || cfg.JWTIssuer != "mini-payment-system" || cfg.JWTAccessTokenTTL != 15*time.Minute || cfg.RabbitMQExchange != "payment.events" || cfg.RabbitMQQueue != "payment.events" || cfg.RabbitMQRoutingKey != "transfer.completed" || cfg.OutboxBatchSize != 20 || cfg.OutboxPollInterval != time.Second || cfg.OutboxLeaseDuration != 30*time.Second || cfg.OutboxMaxBackoff != 5*time.Minute {
 		t.Fatal("configuration defaults were not applied")
+	}
+	if cfg.RabbitMQURL == "" {
+		t.Fatal("local RabbitMQ URL default was not applied")
+	}
+}
+
+func TestLoadRejectsInvalidWorkerConfiguration(t *testing.T) {
+	for _, test := range []struct {
+		key   string
+		value string
+	}{
+		{key: "RABBITMQ_URL", value: "http://localhost:5672"},
+		{key: "OUTBOX_BATCH_SIZE", value: "0"},
+		{key: "OUTBOX_POLL_INTERVAL", value: "not-a-duration"},
+		{key: "OUTBOX_LEASE_DURATION", value: "0s"},
+		{key: "OUTBOX_MAX_BACKOFF", value: "-1s"},
+	} {
+		t.Run(test.key, func(t *testing.T) {
+			withCleanEnvironment(t)
+			t.Setenv("POSTGRES_PASSWORD", "postgres-test")
+			t.Setenv("REDIS_PASSWORD", "redis-test")
+			t.Setenv("JWT_SECRET", "test-jwt-secret-with-at-least-32-bytes")
+			t.Setenv(test.key, test.value)
+			if _, err := Load(); err == nil {
+				t.Fatalf("Load() accepted invalid %s", test.key)
+			}
+		})
 	}
 }
 
@@ -67,6 +94,8 @@ func withCleanEnvironment(t *testing.T) {
 	for _, key := range []string{
 		"APP_ADDR", "POSTGRES_HOST", "POSTGRES_PORT", "POSTGRES_DB", "POSTGRES_USER", "POSTGRES_PASSWORD",
 		"REDIS_HOST", "REDIS_PORT", "REDIS_PASSWORD", "LOG_LEVEL", "JWT_SECRET", "JWT_ISSUER", "JWT_ACCESS_TOKEN_TTL",
+		"RABBITMQ_URL", "RABBITMQ_USER", "RABBITMQ_PASSWORD", "RABBITMQ_EXCHANGE", "RABBITMQ_QUEUE", "RABBITMQ_ROUTING_KEY",
+		"OUTBOX_BATCH_SIZE", "OUTBOX_POLL_INTERVAL", "OUTBOX_LEASE_DURATION", "OUTBOX_MAX_BACKOFF",
 	} {
 		original, hadValue := os.LookupEnv(key)
 		if err := os.Unsetenv(key); err != nil {

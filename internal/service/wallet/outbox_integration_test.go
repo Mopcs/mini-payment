@@ -78,7 +78,7 @@ func TestTransferOutboxIntegration(t *testing.T) {
 	}
 
 	atomicKey := "outbox-atomic-" + uuid.NewString()
-	installOutboxFailure(t, pool, first.TransactionID)
+	installOutboxFailure(t, pool, sourceWallet.ID)
 	sourceBefore := integrationWalletBalance(t, pool, sourceWallet.ID)
 	destinationBefore := integrationWalletBalance(t, pool, destinationWallet.ID)
 	if _, _, err := transfers.Transfer(ctx, sourceUser.ID, sourceWallet.ID, destinationWallet.ID, 300, "USD", atomicKey); err == nil {
@@ -104,7 +104,7 @@ func TestTransferOutboxIntegration(t *testing.T) {
 		t.Fatalf("failed outbox insert left state behind: transactions=%d entries=%d idempotency=%d", transactionCount, ledgerEntryCount, idempotencyCount)
 	}
 
-	removeOutboxFailure(t, pool, first.TransactionID)
+	removeOutboxFailure(t, pool, sourceWallet.ID)
 	retried, replay, err := transfers.Transfer(ctx, sourceUser.ID, sourceWallet.ID, destinationWallet.ID, 300, "USD", atomicKey)
 	if err != nil || replay {
 		t.Fatalf("transfer retry after rollback = %+v replay=%t err=%v", retried, replay, err)
@@ -180,7 +180,7 @@ func installOutboxFailure(t *testing.T, pool *pgxpool.Pool, suffix uuid.UUID) {
 	if _, err := pool.Exec(context.Background(), functionSQL); err != nil {
 		t.Fatalf("create outbox failure function: %v", err)
 	}
-	if _, err := pool.Exec(context.Background(), fmt.Sprintf("CREATE TRIGGER %s BEFORE INSERT ON outbox_events FOR EACH ROW EXECUTE FUNCTION %s()", triggerName, functionName)); err != nil {
+	if _, err := pool.Exec(context.Background(), fmt.Sprintf("CREATE TRIGGER %s BEFORE INSERT ON outbox_events FOR EACH ROW WHEN (NEW.payload->>'source_wallet_id' = '%s') EXECUTE FUNCTION %s()", triggerName, suffix, functionName)); err != nil {
 		_, _ = pool.Exec(context.Background(), "DROP FUNCTION "+functionName+"()")
 		t.Fatalf("create outbox failure trigger: %v", err)
 	}

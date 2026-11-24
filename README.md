@@ -14,12 +14,12 @@ A Go modular monolith for processing payments between users. PostgreSQL is the s
 1. Copy `.env.example` to `.env` and adjust the local credentials if needed.
 2. Start Docker Desktop (or another Docker Engine with Compose).
 3. Run `make config` to validate the Compose configuration.
-4. Run `make up` to start PostgreSQL and Redis.
+4. Run `make up` to start PostgreSQL, Redis, and RabbitMQ.
 5. Run `make ps` to check container health.
 6. Start the API with `go run ./cmd/api`.
 7. Check `http://localhost:8080/health` and `http://localhost:8080/ready`.
 
-Both services publish ports only on `127.0.0.1`. Their data is stored in Docker named volumes and survives container restarts. Redis persistence uses AOF.
+All three services publish ports only on `127.0.0.1`. Their data is stored in Docker named volumes and survives container restarts. Redis persistence uses AOF.
 
 ## Environment variables
 
@@ -34,12 +34,21 @@ Both services publish ports only on `127.0.0.1`. Their data is stored in Docker 
 | `REDIS_HOST` | Host used by local clients | `127.0.0.1` |
 | `REDIS_PORT` | Published Redis port | `6379` |
 | `REDIS_PASSWORD` | Local Redis password | `local_dev_redis_password` |
+| `RABBITMQ_URL` | AMQP URL used by the worker | `amqp://payment_user:local_dev_rabbitmq_password@127.0.0.1:5672/` |
+| `RABBITMQ_USER` / `RABBITMQ_PASSWORD` | Local RabbitMQ broker credentials | set in `.env` |
+| `RABBITMQ_EXCHANGE` | Durable direct exchange | `payment.events` |
+| `RABBITMQ_QUEUE` | Durable event queue | `payment.events` |
+| `RABBITMQ_ROUTING_KEY` | Queue binding and publish routing key | `transfer.completed` |
+| `OUTBOX_BATCH_SIZE` | Maximum events claimed per poll | `20` |
+| `OUTBOX_POLL_INTERVAL` | Delay between polls and reconnect attempts | `1s` |
+| `OUTBOX_LEASE_DURATION` | How long a worker owns claimed events | `30s` |
+| `OUTBOX_MAX_BACKOFF` | Maximum retry delay | `5m` |
 | `LOG_LEVEL` | JSON log level (`debug`, `info`, `warn`, or `error`) | `info` |
 | `JWT_SECRET` | HMAC signing key, at least 32 bytes | replace the example placeholder |
 | `JWT_ISSUER` | JWT issuer claim | `mini-payment-system` |
 | `JWT_ACCESS_TOKEN_TTL` | Access token lifetime, from 1 second to 24 hours | `15m` |
 
-Compose requires both passwords from `.env`; the example values are for local development only.
+Compose requires PostgreSQL and Redis passwords from `.env`; RabbitMQ fallback credentials are for local development only.
 Environment variables already set in the shell take precedence over values loaded from `.env`.
 Replace the `JWT_SECRET` placeholder in `.env` with a cryptographically random value before running the API; never commit `.env` or use the example value outside local development.
 
@@ -57,7 +66,7 @@ Passwords must contain at least 12 Unicode characters and at most 1024 bytes. Th
 - `make logs` — follow service logs.
 - `make ps` — show container status and health.
 - `make restart` — restart the services.
-- `make clean` — remove containers and data volumes. This permanently deletes PostgreSQL and Redis data.
+- `make clean` — remove containers and data volumes. This permanently deletes PostgreSQL, Redis, and RabbitMQ data.
 - `make config` — validate and print the Compose configuration.
 
 ## Database migrations
@@ -131,7 +140,7 @@ The transfer integration suite covers concurrent transfers from one funded walle
 
 ## Transactional outbox
 
-The transactional outbox prevents a committed transfer from being lost between saving it and later notifying other systems. A `transfer.completed` event is inserted in the same PostgreSQL transaction as wallet balance updates, the transfer ledger record, ledger entries, and the idempotency result. If any part fails, PostgreSQL rolls the entire transaction back. This iteration persists events only; it does not publish them to an external broker.
+The transactional outbox prevents a committed transfer from being lost between saving it and later notifying other systems. A `transfer.completed` event is inserted in the same PostgreSQL transaction as wallet balance updates, the transfer ledger record, ledger entries, and the idempotency result. If any part fails, PostgreSQL rolls the entire transaction back. Migration 5 persists events; Iteration 4.2's separate worker publishes them to RabbitMQ.
 
 Migration 5 creates `outbox_events` with:
 
@@ -139,7 +148,7 @@ Migration 5 creates `outbox_events` with:
 - `event_type` (currently `transfer.completed`) and `payload` (a JSON object).
 - `created_at`, nullable `published_at`, non-negative `attempts` defaulting to zero, and nullable `last_error`.
 
-The partial `outbox_events_unpublished_poll_idx` index orders unpublished rows by creation time and ID for future polling. `outbox_events_aggregate_id_idx` supports looking up events for an aggregate. The transfer payload is:
+Migration 6 adds nullable lease ownership (`locked_by`, `locked_until`) and `next_attempt_at`. Its partial `outbox_events_pending_poll_idx` supports polling unpublished events by retry time, creation time, and ID; the aggregate index supports looking up events for an aggregate. The transfer payload is:
 
 ```json
 {
@@ -153,3 +162,28 @@ The partial `outbox_events_unpublished_poll_idx` index orders unpublished rows b
 ```
 
 The amount is an integer in the currency's smallest unit. Run the outbox integration coverage using the dedicated PostgreSQL test database setup above and `go test ./internal/service/wallet -run TransferOutboxIntegration`. The suite verifies event contents, replay behavior, failed transfers, independent events, and rollback when event insertion fails.
+
+## Outbox worker and RabbitMQ
+
+`make up` starts the official RabbitMQ 4 management image with persistent storage. The AMQP port is published on `127.0.0.1:5672`; the management UI is at `http://localhost:15672`. Local broker credentials come from `RABBITMQ_USER` and `RABBITMQ_PASSWORD` in `.env`. Compose's fallback credentials are for local development only; use separately managed credentials outside local development. Keep these credentials and `RABBITMQ_URL` in sync, URL-encoding special characters in the URL.
+
+Run the API and worker as separate processes, each in its own terminal:
+
+```powershell
+go run ./cmd/api
+go run ./cmd/worker
+```
+
+The API never connects to RabbitMQ. If the broker is unavailable, transfers continue to commit their outbox events, while the separate worker reconnects on its polling interval.
+
+The worker claims due unpublished events in short PostgreSQL transactions with `FOR UPDATE SKIP LOCKED`, then commits those leases before publishing. Active leases prevent normal concurrent claims; an expired lease makes an event available after a worker crash. On publication failure, the worker clears the lease, increments `attempts`, records `last_error`, and schedules exponential backoff starting at one second, capped by `OUTBOX_MAX_BACKOFF`. Confirmed events are marked published and retained in PostgreSQL. RabbitMQ confirmations are awaited, and mandatory publishes that are returned as unroutable are retried.
+
+Delivery is **at least once**, not exactly once. If RabbitMQ confirms a message but PostgreSQL fails to mark it published, the lease eventually expires and the same stable event ID may be published again. Consumers must deduplicate using the AMQP message ID. This iteration includes no consumer, dead-letter queue, or metrics.
+
+Worker repository tests use a separate database named with the `_test` suffix via `OUTBOX_TEST_DATABASE_URL`; keep it separate from `TEST_DATABASE_URL` because Go runs package tests concurrently. Create it and apply all migrations before testing. RabbitMQ integration tests are opt-in and require a separate test broker; set `TEST_RABBITMQ_URL` to its AMQP URL, never to the development broker. Then run:
+
+```powershell
+$env:OUTBOX_TEST_DATABASE_URL = 'postgres://payment_user:test-only-password@127.0.0.1:5433/outbox_worker_test?sslmode=disable'
+go test ./internal/worker/outbox -count=1
+go test -race ./internal/worker/outbox -count=1
+```
