@@ -14,6 +14,8 @@ import (
 	"github.com/joho/godotenv"
 )
 
+var errUsage = errors.New("usage: go run ./cmd/migrate <up|down|version|force VERSION>")
+
 func main() {
 	if err := run(os.Args[1:]); err != nil {
 		fmt.Fprintln(os.Stderr, err)
@@ -23,17 +25,12 @@ func main() {
 
 func run(args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: go run ./cmd/migrate <up|down|version|force VERSION>")
+		return errUsage
 	}
 
-	databaseURL, err := postgresURL()
+	m, err := newMigrator()
 	if err != nil {
 		return err
-	}
-
-	m, err := migrate.New("file://migrations", databaseURL.String())
-	if err != nil {
-		return fmt.Errorf("initialize migration runner: %w", err)
 	}
 	defer func() {
 		_, _ = m.Close()
@@ -41,59 +38,99 @@ func run(args []string) error {
 
 	switch args[0] {
 	case "up":
-		if len(args) != 1 {
-			return errors.New("usage: go run ./cmd/migrate up")
-		}
-		err = m.Up()
-		if errors.Is(err, migrate.ErrNoChange) {
-			fmt.Println("database is up to date")
-			return nil
-		}
-		return migrationError(err)
+		return runUp(m, args)
 	case "down":
-		if len(args) != 1 {
-			return errors.New("usage: go run ./cmd/migrate down")
-		}
-		err = m.Steps(-1)
-		if errors.Is(err, migrate.ErrNoChange) || errors.Is(err, migrate.ErrNilVersion) {
-			fmt.Println("no migration to roll back")
-			return nil
-		}
-		return migrationError(err)
+		return runDown(m, args)
 	case "version":
-		if len(args) != 1 {
-			return errors.New("usage: go run ./cmd/migrate version")
-		}
-		version, dirty, err := m.Version()
-		if errors.Is(err, migrate.ErrNilVersion) {
-			fmt.Println("no migrations applied")
-			return nil
-		}
-		if err != nil {
-			return fmt.Errorf("read migration version: %w", err)
-		}
-		fmt.Printf("version: %d, dirty: %t\n", version, dirty)
-		return nil
+		return runVersion(m, args)
 	case "force":
-		if len(args) != 2 {
-			return errors.New("usage: go run ./cmd/migrate force VERSION")
-		}
-		version, err := strconv.Atoi(args[1])
-		if err != nil || version < 0 {
-			return errors.New("migration version must be a non-negative integer")
-		}
-		_, dirty, err := m.Version()
-		if err != nil || !dirty {
-			return errors.New("force is only allowed when the database is in a dirty migration state")
-		}
-		fmt.Fprintln(os.Stderr, "WARNING: force changes migration bookkeeping without applying SQL; use only after manually recovering a dirty migration.")
-		if err := m.Force(version); err != nil {
-			return fmt.Errorf("force migration version: %w", err)
-		}
-		return nil
+		return runForce(m, args)
 	default:
-		return errors.New("usage: go run ./cmd/migrate <up|down|version|force VERSION>")
+		return errUsage
 	}
+}
+
+func newMigrator() (*migrate.Migrate, error) {
+	databaseURL, err := postgresURL()
+	if err != nil {
+		return nil, err
+	}
+
+	m, err := migrate.New("file://migrations", databaseURL.String())
+	if err != nil {
+		return nil, fmt.Errorf("initialize migration runner: %w", err)
+	}
+	return m, nil
+}
+
+func runUp(m *migrate.Migrate, args []string) error {
+	if len(args) != 1 {
+		return errors.New("usage: go run ./cmd/migrate up")
+	}
+
+	err := m.Up()
+	if errors.Is(err, migrate.ErrNoChange) {
+		fmt.Println("database is up to date")
+		return nil
+	}
+	return migrationError(err)
+}
+
+func runDown(m *migrate.Migrate, args []string) error {
+	if len(args) != 1 {
+		return errors.New("usage: go run ./cmd/migrate down")
+	}
+
+	err := m.Steps(-1)
+	if errors.Is(err, migrate.ErrNoChange) || errors.Is(err, migrate.ErrNilVersion) {
+		fmt.Println("no migration to roll back")
+		return nil
+	}
+	return migrationError(err)
+}
+
+func runVersion(m *migrate.Migrate, args []string) error {
+	if len(args) != 1 {
+		return errors.New("usage: go run ./cmd/migrate version")
+	}
+
+	version, dirty, err := m.Version()
+	if errors.Is(err, migrate.ErrNilVersion) {
+		fmt.Println("no migrations applied")
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("read migration version: %w", err)
+	}
+	fmt.Printf("version: %d, dirty: %t\n", version, dirty)
+	return nil
+}
+
+func runForce(m *migrate.Migrate, args []string) error {
+	if len(args) != 2 {
+		return errors.New("usage: go run ./cmd/migrate force VERSION")
+	}
+
+	version, err := strconv.Atoi(args[1])
+	if err != nil || version < 0 {
+		return errors.New("migration version must be a non-negative integer")
+	}
+
+	// Force only rewrites the bookkeeping table, so refuse it on a clean database
+	// where a real migration would fix things.
+	_, dirty, err := m.Version()
+	if err != nil || !dirty {
+		return errors.New("force is only allowed when the database is in a dirty migration state")
+	}
+
+	fmt.Fprintln(os.Stderr,
+		"WARNING: force changes migration bookkeeping without applying SQL; "+
+			"use only after manually recovering a dirty migration.")
+
+	if err := m.Force(version); err != nil {
+		return fmt.Errorf("force migration version: %w", err)
+	}
+	return nil
 }
 
 func migrationError(err error) error {
@@ -112,6 +149,7 @@ func postgresURL() (*url.URL, error) {
 	if !ok || password == "" {
 		return nil, errors.New("POSTGRES_PASSWORD is required")
 	}
+
 	port := envOrDefault("POSTGRES_PORT", "5432")
 	portNumber, err := strconv.ParseUint(port, 10, 16)
 	if err != nil || portNumber == 0 {
