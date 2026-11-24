@@ -92,7 +92,7 @@ func TestAuthRequestValidation(t *testing.T) {
 		{name: "malformed json", body: `{"email":`, contentType: "application/json", want: http.StatusBadRequest},
 		{name: "trailing json", body: `{} {}`, contentType: "application/json", want: http.StatusBadRequest},
 		{name: "unknown field", body: `{"email":"a@example.com","password":"StrongPassword123!","admin":true}`, contentType: "application/json", want: http.StatusBadRequest},
-		{name: "large body", body: strings.Repeat(" ", maxAuthRequestBytes+1), contentType: "application/json", want: http.StatusRequestEntityTooLarge},
+		{name: "large body", body: strings.Repeat(" ", maxAuthBodyBytes+1), contentType: "application/json", want: http.StatusRequestEntityTooLarge},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			response := sendAuthRequest(&authServiceStub{}, "/api/v1/auth/register", test.body, test.contentType)
