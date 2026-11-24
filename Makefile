@@ -1,4 +1,4 @@
-.PHONY: up down logs ps restart clean config migrate-up migrate-down migrate-version migrate-force
+.PHONY: up down logs ps restart clean config migrate-up migrate-down migrate-version migrate-force dashboards-validate
 
 up:
 	docker compose up -d
@@ -34,3 +34,6 @@ migrate-version:
 migrate-force:
 	@echo WARNING: force only recovers dirty migration bookkeeping and does not execute SQL.
 	go run ./cmd/migrate force $(VERSION)
+
+dashboards-validate:
+	python deployments/monitoring/validate_dashboards.py

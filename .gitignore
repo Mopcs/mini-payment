@@ -22,3 +22,6 @@ coverage.html
 .idea/
 .vscode/
 *.iml
+
+# Python bytecode from the dashboard validation helper
+__pycache__/
