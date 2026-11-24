@@ -14,12 +14,13 @@ A Go modular monolith for processing payments between users. PostgreSQL is the s
 1. Copy `.env.example` to `.env` and adjust the local credentials if needed.
 2. Start Docker Desktop (or another Docker Engine with Compose).
 3. Run `make config` to validate the Compose configuration.
-4. Run `make up` to start PostgreSQL, Redis, and RabbitMQ.
+4. Run `make up` to start PostgreSQL, Redis, RabbitMQ, Prometheus, and Grafana.
 5. Run `make ps` to check container health.
 6. Start the API with `go run ./cmd/api`.
 7. Check `http://localhost:8080/health` and `http://localhost:8080/ready`.
+8. Open Grafana at `http://localhost:3000` for the provisioned dashboards, and Prometheus at `http://localhost:9090`.
 
-All three services publish ports only on `127.0.0.1`. Their data is stored in Docker named volumes and survives container restarts. Redis persistence uses AOF.
+All services publish ports only on `127.0.0.1`. Their data is stored in Docker named volumes and survives container restarts. Redis persistence uses AOF, and Prometheus keeps 15 days of metrics by default.
 
 ## Environment variables
 
@@ -31,6 +32,7 @@ All three services publish ports only on `127.0.0.1`. Their data is stored in Do
 | `POSTGRES_PASSWORD` | Local PostgreSQL password | `local_dev_postgres_password` |
 | `POSTGRES_HOST` | Host used by local clients | `127.0.0.1` |
 | `POSTGRES_PORT` | Published PostgreSQL port | `5432` |
+| `PGSSLMODE` | TLS mode for the PostgreSQL pool; the Compose container serves no TLS | `disable` |
 | `REDIS_HOST` | Host used by local clients | `127.0.0.1` |
 | `REDIS_PORT` | Published Redis port | `6379` |
 | `REDIS_PASSWORD` | Local Redis password | `local_dev_redis_password` |
@@ -47,6 +49,12 @@ All three services publish ports only on `127.0.0.1`. Their data is stored in Do
 | `JWT_SECRET` | HMAC signing key, at least 32 bytes | replace the example placeholder |
 | `JWT_ISSUER` | JWT issuer claim | `mini-payment-system` |
 | `JWT_ACCESS_TOKEN_TTL` | Access token lifetime, from 1 second to 24 hours | `15m` |
+| `API_METRICS_ADDR` / `WORKER_METRICS_ADDR` / `CONSUMER_METRICS_ADDR` | Metrics listener per process, must be distinct ports | `0.0.0.0:9091` |
+| `PROMETHEUS_PORT` | Published Prometheus port | `9090` |
+| `PROMETHEUS_RETENTION` | Prometheus retention window | `15d` |
+| `GRAFANA_PORT` | Published Grafana port | `3000` |
+| `GRAFANA_ADMIN_USER` | Grafana administrator login | `admin` |
+| `GRAFANA_ADMIN_PASSWORD` | Grafana administrator password | set in `.env`, never commit it |
 
 Compose requires PostgreSQL and Redis passwords from `.env`; RabbitMQ fallback credentials are for local development only.
 Environment variables already set in the shell take precedence over values loaded from `.env`.
@@ -68,6 +76,7 @@ Passwords must contain at least 12 Unicode characters and at most 1024 bytes. Th
 - `make restart` — restart the services.
 - `make clean` — remove containers and data volumes. This permanently deletes PostgreSQL, Redis, and RabbitMQ data.
 - `make config` — validate and print the Compose configuration.
+- `make dashboards-validate` — run every dashboard PromQL query against the running Prometheus.
 
 ## Database migrations
 
@@ -226,37 +235,129 @@ go test ./internal/worker/outbox -count=1
 go test -race ./internal/worker/outbox -count=1
 ```
 
-## Prometheus metrics
+## Monitoring
 
-The API, outbox worker, and transfer consumer each start a separate metrics
-listener. The defaults bind to loopback so they are not exposed to other
-machines:
+Prometheus and Grafana run in Docker Compose and scrape the three Go processes,
+which run on the host. Each process exposes its own endpoint:
 
-| Process | Address | Metrics |
+| Process | Default endpoint | Metrics |
 | --- | --- | --- |
-| API | `127.0.0.1:9091/metrics` | HTTP request totals, duration, in-progress requests |
-| Worker | `127.0.0.1:9092/metrics` | Claimed and published events, publish failures, retries, active jobs, oldest pending age |
-| Consumer | `127.0.0.1:9093/metrics` | Deliveries, processed and duplicate events, failures, dead letters, processing duration |
+| API | `0.0.0.0:9091/metrics` | HTTP request totals, duration, in-progress requests, pgxpool statistics |
+| Worker | `0.0.0.0:9092/metrics` | Claimed and published events, publish failures, retries, active jobs, oldest pending age, pgxpool statistics |
+| Consumer | `0.0.0.0:9093/metrics` | Deliveries, processed and duplicate events, failures, dead letters, processing duration, pgxpool statistics |
 
-All processes also expose Go runtime and process metrics. The worker and
-consumer expose pgxpool connection state and acquisition statistics.
+All three also expose Go runtime and process metrics.
 
-Set `API_METRICS_ADDR`, `WORKER_METRICS_ADDR`, and `CONSUMER_METRICS_ADDR` to
-change the listen addresses. Each address must be a valid, distinct `host:port`.
-For Prometheus running on the same machine, the defaults in
-[`prometheus.yml`](prometheus.yml) are ready to use. If Prometheus runs in a
-container, bind metrics to a private interface reachable from that container
-and update the scrape targets accordingly.
+### Start the stack
 
-Start each application process separately:
-
-```powershell
-go run ./cmd/api
-go run ./cmd/worker
-go run ./cmd/consumer
+```sh
+docker compose up -d      # PostgreSQL, Redis, RabbitMQ, Prometheus, Grafana
+go run ./cmd/api          # terminal 1
+go run ./cmd/worker       # terminal 2
+go run ./cmd/consumer     # terminal 3
 ```
 
-Metrics include operational details such as route patterns and queue health.
-Keep the listener on loopback or a trusted private network. When metrics must
-cross an untrusted network, put them behind an authenticated proxy or network
-access control; do not expose these ports publicly.
+Grafana starts only after the Prometheus health check passes, and both
+monitoring UIs bind to loopback.
+
+| UI | URL |
+| --- | --- |
+| Prometheus | http://127.0.0.1:9090 |
+| Prometheus targets | http://127.0.0.1:9090/targets |
+| Grafana | http://127.0.0.1:3000 |
+
+Sign in with `GRAFANA_ADMIN_USER` and `GRAFANA_ADMIN_PASSWORD` from `.env`.
+Anonymous access and sign-up are disabled.
+
+### Dashboards
+
+Dashboard JSON lives in `deployments/monitoring/grafana/dashboards/` and is
+version controlled:
+
+- `api-overview.json` — request rate, status mix, 5xx share, latency p50/p95/p99, in-progress requests, pool utilization, connection acquisition.
+- `payment-pipeline.json` — transfer acceptance, outbox publishing, consumer processing, plus a notes panel explaining why those three stages are different numbers.
+
+Grafana loads them through the file provider in
+`deployments/monitoring/grafana/provisioning/dashboards/dashboards.yml`, which
+points at `/var/lib/grafana/dashboards` inside the container. The provider
+polls that directory every 30 seconds and `allowUiUpdates` is off, so the files
+are the source of truth: edit the JSON, not the browser. The Prometheus
+datasource is provisioned from
+`deployments/monitoring/grafana/provisioning/datasources/prometheus.yml` with
+the fixed uid `prometheus`, which every panel references.
+
+### Scrape targets
+
+`deployments/monitoring/prometheus/prometheus.yml` scrapes four targets every
+15 seconds with a 10 second timeout: Prometheus itself, `payment-api`,
+`payment-worker`, and `payment-consumer`.
+
+The Go processes run on the host while Prometheus runs in a container, so the
+targets use `host.docker.internal`, which Compose maps to the host gateway
+through `extra_hosts`. That is why `.env.example` binds the metrics listeners to
+`0.0.0.0`: a loopback-only listener is unreachable from inside the container.
+
+If Prometheus runs on the host, or the processes run on another machine, replace
+`host.docker.internal` with a reachable address:
+
+```yaml
+  - job_name: payment-api
+    static_configs:
+      - targets: ["192.168.1.20:9091"]
+```
+
+If the Go processes are containerised later, use Compose service names instead:
+
+```yaml
+      - targets: ["api:9091"]
+```
+
+Reload after editing, without restarting the container:
+
+```sh
+curl -X POST http://127.0.0.1:9090/-/reload
+```
+
+### Configure Grafana credentials
+
+Set `GRAFANA_ADMIN_USER` and `GRAFANA_ADMIN_PASSWORD` in `.env` before the first
+start; Compose refuses to start Grafana when either is missing. Grafana applies
+the password only when it creates the admin user in an empty database, so
+changing it later needs the Grafana UI or `docker compose down -v`, which also
+deletes the Grafana and Prometheus volumes. `.env` is gitignored and
+`.env.example` holds placeholders only.
+
+### Security
+
+Both monitoring ports are published on `127.0.0.1` only, and Grafana
+authentication stays enabled. Metrics carry no user, wallet, or transfer
+identifiers: labels are limited to method, route pattern, and status code. For
+production, keep the stack on a private network, put Grafana behind an
+authenticated reverse proxy, and firewall the metrics ports so only Prometheus
+can reach them. Do not expose 9090 or 3000 publicly.
+
+### Troubleshooting
+
+| Symptom | Cause and fix |
+| --- | --- |
+| Target is DOWN with `connect: connection refused` | The process is not running, or it listens on another port. Start it and compare `API_METRICS_ADDR` with the target in `deployments/monitoring/prometheus/prometheus.yml`. |
+| Targets are DOWN with `context deadline exceeded` | The listener is on `127.0.0.1`, so the container cannot reach it. Set `API_METRICS_ADDR=0.0.0.0:9091` (and the worker/consumer equivalents) and restart the processes. |
+| Targets are DOWN after editing the scrape config | Prometheus validates the config on reload. Check `docker compose logs prometheus` and run the `promtool` check below. |
+| Grafana shows "No data" | The datasource works but the query has no series. Send a request to the API or widen the time range; panels that depend on 5xx responses stay empty until an error happens. |
+| Grafana runs but has no dashboards | The JSON is missing from `deployments/monitoring/grafana/dashboards/`, or the provisioning path does not match the mount. Check `docker compose logs grafana`. |
+| Worker logs `failed to connect ... tls error` | `PGSSLMODE` is not `disable` and the container serves no TLS certificate. |
+| Prometheus is unhealthy right after `up` | The first start creates the time series database. The health check covers it and Grafana already waits for it. |
+
+### Validate the monitoring configuration
+
+```sh
+docker compose config
+docker run --rm -v "$(pwd -W)/deployments/monitoring/prometheus:/cfg:ro" \
+  --entrypoint promtool prom/prometheus:v3.16.0-busybox check config /cfg/prometheus.yml
+python deployments/monitoring/validate_dashboards.py
+curl http://127.0.0.1:9090/api/v1/targets
+```
+
+`validate_dashboards.py` needs only the standard library and a reachable
+Prometheus. It substitutes the Grafana-only variables and reports `OK`, `EMPTY`,
+or `ERROR` for every panel query.
