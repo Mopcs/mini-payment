@@ -33,7 +33,10 @@ type Service struct {
 }
 
 func NewService(pool *pgxpool.Pool) *Service {
-	return &Service{repository: postgres.NewWalletRepository(pool), deposits: postgres.NewDepositRepository(pool)}
+	return &Service{
+		repository: postgres.NewWalletRepository(pool),
+		deposits:   postgres.NewDepositRepository(pool),
+	}
 }
 
 func (s *Service) List(ctx context.Context, userID uuid.UUID) ([]domain.Wallet, error) {
@@ -55,7 +58,11 @@ func (s *Service) Get(ctx context.Context, userID, walletID uuid.UUID) (*domain.
 	return wallet, nil
 }
 
-func (s *Service) Create(ctx context.Context, userID uuid.UUID, currency string) (*domain.Wallet, error) {
+func (s *Service) Create(
+	ctx context.Context,
+	userID uuid.UUID,
+	currency string,
+) (*domain.Wallet, error) {
 	currency = domain.NormalizeCurrency(currency)
 	if !domain.IsSupportedCurrency(currency) {
 		return nil, ErrInvalidCurrency
@@ -71,7 +78,12 @@ func (s *Service) Create(ctx context.Context, userID uuid.UUID, currency string)
 	return wallet, nil
 }
 
-func (s *Service) Deposit(ctx context.Context, userID, walletID uuid.UUID, amount int64, currency, idempotencyKey string) (domain.Deposit, bool, error) {
+func (s *Service) Deposit(
+	ctx context.Context,
+	userID, walletID uuid.UUID,
+	amount int64,
+	currency, idempotencyKey string,
+) (domain.Deposit, bool, error) {
 	if amount <= 0 {
 		return domain.Deposit{}, false, ErrInvalidAmount
 	}
@@ -89,26 +101,44 @@ func (s *Service) Deposit(ctx context.Context, userID, walletID uuid.UUID, amoun
 	// The hash covers every field that defines the request. A retry with the same
 	// key has to hash identically; anything else is the client reusing a key.
 	requestHash := depositRequestHash(userID, walletID, amount, currency)
-	deposit, replay, err := s.deposits.Create(ctx, userID, walletID, amount, currency, idempotencyKey, requestHash[:])
+	deposit, replay, err := s.deposits.Create(ctx, postgres.DepositRequest{
+		UserID:         userID,
+		WalletID:       walletID,
+		Amount:         amount,
+		Currency:       currency,
+		IdempotencyKey: idempotencyKey,
+		RequestHash:    requestHash[:],
+	})
+	if err != nil {
+		return domain.Deposit{}, false, translateDepositError(err)
+	}
+	return deposit, replay, nil
+}
+
+// translateDepositError maps repository outcomes onto the errors handlers
+// already know how to answer.
+func translateDepositError(err error) error {
 	switch {
 	case errors.Is(err, postgres.ErrDepositWalletNotFound):
-		return domain.Deposit{}, false, ErrNotFound
+		return ErrNotFound
 	case errors.Is(err, postgres.ErrDepositCurrencyMismatch):
-		return domain.Deposit{}, false, ErrCurrencyMismatch
+		return ErrCurrencyMismatch
 	case errors.Is(err, postgres.ErrIdempotencyConflict):
-		return domain.Deposit{}, false, ErrIdempotencyConflict
+		return ErrIdempotencyConflict
 	case errors.Is(err, postgres.ErrLedgerAccountMissing):
-		return domain.Deposit{}, false, ErrLedgerAccountMissing
+		return ErrLedgerAccountMissing
 	case errors.Is(err, postgres.ErrBalanceOverflow):
-		return domain.Deposit{}, false, ErrBalanceLimit
-	case err != nil:
-		return domain.Deposit{}, false, fmt.Errorf("deposit funds: %w", err)
+		return ErrBalanceLimit
 	default:
-		return deposit, replay, nil
+		return fmt.Errorf("deposit funds: %w", err)
 	}
 }
 
-func depositRequestHash(userID, walletID uuid.UUID, amount int64, currency string) [sha256.Size]byte {
+func depositRequestHash(
+	userID, walletID uuid.UUID,
+	amount int64,
+	currency string,
+) [sha256.Size]byte {
 	var request [16 + 16 + 8 + 3]byte
 	copy(request[:16], userID[:])
 	copy(request[16:32], walletID[:])

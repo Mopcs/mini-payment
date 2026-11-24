@@ -39,53 +39,96 @@ func NewService(pool *pgxpool.Pool) *Service {
 	return &Service{repository: postgres.NewTransferRepository(pool)}
 }
 
-func (s *Service) Transfer(ctx context.Context, userID, sourceWalletID, destinationWalletID uuid.UUID, amount int64, currency, idempotencyKey string) (domain.Transfer, bool, error) {
-	if amount <= 0 {
-		return domain.Transfer{}, false, ErrInvalidAmount
-	}
-	if sourceWalletID == uuid.Nil || destinationWalletID == uuid.Nil {
-		return domain.Transfer{}, false, ErrInvalidWalletID
-	}
-	if sourceWalletID == destinationWalletID {
-		return domain.Transfer{}, false, ErrSameWallet
-	}
-	currency = domain.NormalizeCurrency(currency)
-	if !domain.IsSupportedCurrency(currency) {
-		return domain.Transfer{}, false, ErrInvalidCurrency
-	}
-
-	idempotencyKey = strings.TrimSpace(idempotencyKey)
-	if len(idempotencyKey) == 0 || len(idempotencyKey) > maxIdempotencyKeyBytes {
-		return domain.Transfer{}, false, ErrInvalidIdempotencyKey
+func (s *Service) Transfer(
+	ctx context.Context,
+	userID, sourceWalletID, destinationWalletID uuid.UUID,
+	amount int64,
+	currency, idempotencyKey string,
+) (domain.Transfer, bool, error) {
+	currency, idempotencyKey, err := validateTransfer(
+		sourceWalletID, destinationWalletID, amount, currency, idempotencyKey,
+	)
+	if err != nil {
+		return domain.Transfer{}, false, err
 	}
 
 	// Same hashing scheme as deposits, except the type tag goes into the input.
 	// That way a key used for a deposit can never be replayed as a transfer.
-	requestHash := transferRequestHash(userID, sourceWalletID, destinationWalletID, amount, currency)
-	result, replay, err := s.repository.Create(ctx, userID, sourceWalletID, destinationWalletID, amount, currency, idempotencyKey, requestHash[:])
+	requestHash := transferRequestHash(
+		userID, sourceWalletID, destinationWalletID, amount, currency,
+	)
+	result, replay, err := s.repository.Create(ctx, postgres.TransferRequest{
+		UserID:         userID,
+		SourceID:       sourceWalletID,
+		DestinationID:  destinationWalletID,
+		Amount:         amount,
+		Currency:       currency,
+		IdempotencyKey: idempotencyKey,
+		RequestHash:    requestHash[:],
+	})
+	if err != nil {
+		return domain.Transfer{}, false, translateTransferError(err)
+	}
+	return result, replay, nil
+}
+
+// validateTransfer checks the request and returns the normalized currency and
+// idempotency key.
+func validateTransfer(
+	sourceWalletID, destinationWalletID uuid.UUID,
+	amount int64,
+	currency, idempotencyKey string,
+) (string, string, error) {
+	if amount <= 0 {
+		return "", "", ErrInvalidAmount
+	}
+	if sourceWalletID == uuid.Nil || destinationWalletID == uuid.Nil {
+		return "", "", ErrInvalidWalletID
+	}
+	if sourceWalletID == destinationWalletID {
+		return "", "", ErrSameWallet
+	}
+
+	currency = domain.NormalizeCurrency(currency)
+	if !domain.IsSupportedCurrency(currency) {
+		return "", "", ErrInvalidCurrency
+	}
+
+	idempotencyKey = strings.TrimSpace(idempotencyKey)
+	if len(idempotencyKey) == 0 || len(idempotencyKey) > maxIdempotencyKeyBytes {
+		return "", "", ErrInvalidIdempotencyKey
+	}
+	return currency, idempotencyKey, nil
+}
+
+// translateTransferError maps repository outcomes onto the errors handlers
+// already know how to answer.
+func translateTransferError(err error) error {
 	switch {
 	case errors.Is(err, postgres.ErrIdempotencyConflict):
-		return domain.Transfer{}, false, ErrIdempotencyConflict
+		return ErrIdempotencyConflict
 	case errors.Is(err, postgres.ErrTransferWalletNotFound),
 		errors.Is(err, postgres.ErrTransferSourceNotOwned),
 		errors.Is(err, postgres.ErrWalletBalanceChanged):
-		return domain.Transfer{}, false, ErrNotFound
+		return ErrNotFound
 	case errors.Is(err, postgres.ErrTransferCurrencyMismatch):
-		return domain.Transfer{}, false, ErrCurrencyMismatch
+		return ErrCurrencyMismatch
 	case errors.Is(err, postgres.ErrInsufficientFunds):
-		return domain.Transfer{}, false, ErrInsufficientFunds
+		return ErrInsufficientFunds
 	case errors.Is(err, postgres.ErrBalanceOverflow):
-		return domain.Transfer{}, false, ErrBalanceLimit
+		return ErrBalanceLimit
 	case errors.Is(err, postgres.ErrLedgerAccountMissing):
-		return domain.Transfer{}, false, ErrLedgerAccountMissing
-	case err != nil:
-		return domain.Transfer{}, false, fmt.Errorf("execute transfer: %w", err)
+		return ErrLedgerAccountMissing
 	default:
-		return result, replay, nil
+		return fmt.Errorf("execute transfer: %w", err)
 	}
 }
 
-func (s *Service) List(ctx context.Context, userID uuid.UUID, filter domain.TransferHistoryFilter) ([]domain.TransferHistoryItem, int64, error) {
+func (s *Service) List(
+	ctx context.Context,
+	userID uuid.UUID,
+	filter domain.TransferHistoryFilter,
+) ([]domain.TransferHistoryItem, int64, error) {
 	items, total, err := s.repository.List(ctx, userID, filter)
 	if err != nil {
 		return nil, 0, fmt.Errorf("list transfer history: %w", err)
@@ -93,7 +136,11 @@ func (s *Service) List(ctx context.Context, userID uuid.UUID, filter domain.Tran
 	return items, total, nil
 }
 
-func transferRequestHash(userID, sourceWalletID, destinationWalletID uuid.UUID, amount int64, currency string) [sha256.Size]byte {
+func transferRequestHash(
+	userID, sourceWalletID, destinationWalletID uuid.UUID,
+	amount int64,
+	currency string,
+) [sha256.Size]byte {
 	var request [8 + 16 + 16 + 16 + 8 + 3]byte
 	copy(request[:8], "transfer")
 	copy(request[8:24], userID[:])
