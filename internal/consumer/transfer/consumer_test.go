@@ -8,18 +8,22 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Mopcs/mini-payment-system/internal/observability"
 	"github.com/google/uuid"
+	"github.com/prometheus/client_golang/prometheus"
+	dto "github.com/prometheus/client_model/go"
 	"github.com/rabbitmq/amqp091-go"
 )
 
 type testProcessor struct {
-	err    error
-	called bool
+	err       error
+	called    bool
+	duplicate bool
 }
 
 func (p *testProcessor) Process(context.Context, uuid.UUID, string, []byte) (bool, error) {
 	p.called = true
-	return false, p.err
+	return p.duplicate, p.err
 }
 
 type testPublisher struct {
@@ -58,7 +62,23 @@ func (*testAcknowledger) Reject(uint64, bool) error     { return nil }
 
 func testConsumer(t *testing.T, p Processor) *Consumer {
 	t.Helper()
-	c, err := NewWithProcessor(Settings{URL: "amqp://localhost", Exchange: "main", Queue: "main", RoutingKey: "transfer.completed", RetryExchange: "retry", RetryQueue: "retry", DeadLetterExchange: "dead", DeadLetterQueue: "dead", DeadLetterRoutingKey: "failed", RetryDelay: time.Second, MaxRetries: 2, Prefetch: 1, ReconnectInterval: time.Second}, p, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	settings := Settings{
+		URL:                  "amqp://localhost",
+		Exchange:             "main",
+		Queue:                "main",
+		RoutingKey:           "transfer.completed",
+		RetryExchange:        "retry",
+		RetryQueue:           "retry",
+		DeadLetterExchange:   "dead",
+		DeadLetterQueue:      "dead",
+		DeadLetterRoutingKey: "failed",
+		RetryDelay:           time.Second,
+		MaxRetries:           2,
+		Prefetch:             1,
+		ReconnectInterval:    time.Second,
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	c, err := NewWithProcessor(settings, p, logger)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -82,6 +102,8 @@ func TestHandleSchedulesConfirmedRetryBeforeAck(t *testing.T) {
 func TestHandleRoutesPermanentFailureToDeadLetter(t *testing.T) {
 	processor := &testProcessor{err: errors.Join(ErrPermanent, errors.New("invalid"))}
 	c := testConsumer(t, processor)
+	registry := prometheus.NewRegistry()
+	c.metrics = observability.NewConsumerMetrics(registry)
 	publisher := &testPublisher{}
 	acker := &testAcknowledger{published: publisher}
 	d := amqp091.Delivery{Acknowledger: acker, DeliveryTag: 5, MessageId: uuid.NewString(), Headers: amqp091.Table{"event_type": "invalid"}, Body: []byte("not logged")}
@@ -91,6 +113,9 @@ func TestHandleRoutesPermanentFailureToDeadLetter(t *testing.T) {
 	if !acker.acked || publisher.exchange != "dead" || publisher.key != "failed" || publisher.message.Headers["x-failure-reason"] != "permanent event error" {
 		t.Fatalf("permanent message was not dead-lettered: %+v", publisher)
 	}
+	assertMetric(t, c.metrics.MessagesReceived, 1)
+	assertMetric(t, c.metrics.ProcessingFailures, 1)
+	assertMetric(t, c.metrics.DeadLettered, 1)
 }
 
 func TestHandleMovesExhaustedMessageToDeadLetter(t *testing.T) {
@@ -134,6 +159,38 @@ func TestHandleAcknowledgesOnlyAfterSuccessfulProcessing(t *testing.T) {
 	}
 }
 
+func TestConsumerMetricsTrackDuplicateAndFailedDeliveries(t *testing.T) {
+	registry := prometheus.NewRegistry()
+	metrics := observability.NewConsumerMetrics(registry)
+	processor := &testProcessor{duplicate: true}
+	c := testConsumer(t, processor)
+	c.metrics = metrics
+	message := amqp091.Delivery{
+		Acknowledger: &testAcknowledger{processor: processor},
+		MessageId:    uuid.NewString(),
+		Headers:      amqp091.Table{"event_type": "transfer.completed"},
+	}
+	if err := c.handle(context.Background(), message, &testPublisher{}); err != nil {
+		t.Fatal(err)
+	}
+
+	processor.err = errors.New("database unavailable")
+	publisher := &testPublisher{}
+	message.Acknowledger = &testAcknowledger{published: publisher}
+	if err := c.handle(context.Background(), message, publisher); err != nil {
+		t.Fatal(err)
+	}
+	assertMetric(t, metrics.MessagesReceived, 2)
+	assertMetric(t, metrics.MessagesProcessed, 1)
+	assertMetric(t, metrics.DuplicateEvents, 1)
+	assertMetric(t, metrics.ProcessingFailures, 1)
+	assertMetric(t, metrics.DeadLettered, 0)
+	name := "payment_consumer_processing_duration_seconds"
+	if got := histogramSampleCount(t, registry, name); got != 2 {
+		t.Fatalf("processing histogram count = %d, want 2", got)
+	}
+}
+
 func TestMalformedAndUnsupportedEventsGoToDeadLetter(t *testing.T) {
 	for _, tc := range []struct {
 		name, eventType string
@@ -169,4 +226,34 @@ func TestRetryCountValidation(t *testing.T) {
 			t.Errorf("retryCount(%v) = %d, %v", tc.input, got, err)
 		}
 	}
+}
+
+func assertMetric(t *testing.T, metric prometheus.Metric, want float64) {
+	t.Helper()
+	data := &dto.Metric{}
+	if err := metric.Write(data); err != nil {
+		t.Fatal(err)
+	}
+	value := data.Counter.GetValue()
+	if data.Gauge != nil {
+		value = data.Gauge.GetValue()
+	}
+	if value != want {
+		t.Fatalf("metric value = %v, want %v", value, want)
+	}
+}
+
+func histogramSampleCount(t *testing.T, registry *prometheus.Registry, name string) uint64 {
+	t.Helper()
+	families, err := registry.Gather()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, family := range families {
+		if family.GetName() == name {
+			return family.Metric[0].GetHistogram().GetSampleCount()
+		}
+	}
+	t.Fatalf("histogram %q is not registered", name)
+	return 0
 }

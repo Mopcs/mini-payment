@@ -17,6 +17,7 @@ import (
 	"github.com/rabbitmq/amqp091-go"
 
 	"github.com/Mopcs/mini-payment-system/internal/domain"
+	"github.com/Mopcs/mini-payment-system/internal/observability"
 	"github.com/Mopcs/mini-payment-system/internal/repository/postgres"
 )
 
@@ -46,6 +47,7 @@ type Settings struct {
 	MaxRetries        int
 	Prefetch          int
 	ReconnectInterval time.Duration
+	Metrics           *observability.ConsumerMetrics
 }
 
 type Processor interface {
@@ -60,23 +62,48 @@ type Consumer struct {
 	settings  Settings
 	processor Processor
 	logger    *slog.Logger
+	metrics   *observability.ConsumerMetrics
+}
+
+type deliveryFailure struct {
+	eventID    uuid.UUID
+	eventType  string
+	retryCount int
+	reason     string
+	err        error
+}
+
+type forwardingTarget struct {
+	exchange   string
+	routingKey string
+	reason     string
 }
 
 func New(pool *pgxpool.Pool, settings Settings, logger *slog.Logger) (*Consumer, error) {
 	if pool == nil || logger == nil {
 		return nil, errors.New("consumer requires a PostgreSQL pool and logger")
 	}
-	return NewWithProcessor(settings, &transferProcessor{repo: postgres.NewNotificationRepository(pool)}, logger)
+	processor := &transferProcessor{repo: postgres.NewNotificationRepository(pool)}
+	return NewWithProcessor(settings, processor, logger)
 }
 
-func NewWithProcessor(settings Settings, processor Processor, logger *slog.Logger) (*Consumer, error) {
+func NewWithProcessor(
+	settings Settings,
+	processor Processor,
+	logger *slog.Logger,
+) (*Consumer, error) {
 	if processor == nil || logger == nil {
 		return nil, errors.New("consumer requires a processor and logger")
 	}
 	if err := settings.validate(); err != nil {
 		return nil, err
 	}
-	return &Consumer{settings: settings, processor: processor, logger: logger}, nil
+	return &Consumer{
+		settings:  settings,
+		processor: processor,
+		logger:    logger,
+		metrics:   settings.Metrics,
+	}, nil
 }
 
 func (s Settings) validate() error {
@@ -133,7 +160,13 @@ func (c *Consumer) consumeSession(ctx context.Context) error {
 		return err
 	}
 	defer conn.Close()
+	return c.consumeConnection(ctx, conn)
+}
 
+func (c *Consumer) consumeConnection(
+	ctx context.Context,
+	conn *amqp091.Connection,
+) error {
 	consumeCh, err := conn.Channel()
 	if err != nil {
 		return errors.New("open consumer channel failed")
@@ -145,7 +178,14 @@ func (c *Consumer) consumeSession(ctx context.Context) error {
 		return errors.New("open publisher channel failed")
 	}
 	defer pubCh.Close()
+	return c.consumeChannels(ctx, consumeCh, pubCh)
+}
 
+func (c *Consumer) consumeChannels(
+	ctx context.Context,
+	consumeCh *amqp091.Channel,
+	pubCh *amqp091.Channel,
+) error {
 	if err := c.declareTopology(consumeCh); err != nil {
 		return fmt.Errorf("declare consumer topology: %w", err)
 	}
@@ -162,7 +202,14 @@ func (c *Consumer) consumeSession(ctx context.Context) error {
 	if err != nil {
 		return errors.New("start RabbitMQ consumer failed")
 	}
+	return c.consumeDeliveries(ctx, deliveries, publisher)
+}
 
+func (c *Consumer) consumeDeliveries(
+	ctx context.Context,
+	deliveries <-chan amqp091.Delivery,
+	publisher *confirmedPublisher,
+) error {
 	for {
 		select {
 		case <-ctx.Done():
@@ -212,6 +259,17 @@ type queueBinding struct {
 }
 
 func (c *Consumer) declareTopology(ch *amqp091.Channel) error {
+	if err := c.declareExchanges(ch); err != nil {
+		return err
+	}
+	bindings, err := c.declareQueues(ch)
+	if err != nil {
+		return err
+	}
+	return bindQueues(ch, bindings)
+}
+
+func (c *Consumer) declareExchanges(ch *amqp091.Channel) error {
 	for _, exchange := range []string{
 		c.settings.Exchange,
 		c.settings.RetryExchange,
@@ -221,10 +279,13 @@ func (c *Consumer) declareTopology(ch *amqp091.Channel) error {
 			return err
 		}
 	}
+	return nil
+}
 
+func (c *Consumer) declareQueues(ch *amqp091.Channel) ([]queueBinding, error) {
 	mainQueue, err := ch.QueueDeclare(c.settings.Queue, true, false, false, false, nil)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	// The retry queue holds a message for RetryDelay and then dead-letters it
@@ -235,21 +296,32 @@ func (c *Consumer) declareTopology(ch *amqp091.Channel) error {
 		"x-dead-letter-routing-key": c.settings.RoutingKey,
 	})
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	deadLetterQueue, err := ch.QueueDeclare(c.settings.DeadLetterQueue, true, false, false, false, nil)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	bindings := []queueBinding{
 		{queue: mainQueue.Name, routingKey: c.settings.RoutingKey, exchange: c.settings.Exchange},
 		{queue: retryQueue.Name, routingKey: c.settings.RoutingKey, exchange: c.settings.RetryExchange},
-		{queue: deadLetterQueue.Name, routingKey: c.settings.DeadLetterRoutingKey, exchange: c.settings.DeadLetterExchange},
+		{
+			queue:      deadLetterQueue.Name,
+			routingKey: c.settings.DeadLetterRoutingKey,
+			exchange:   c.settings.DeadLetterExchange,
+		},
 	}
+	return bindings, nil
+}
+
+func bindQueues(ch *amqp091.Channel, bindings []queueBinding) error {
 	for _, binding := range bindings {
-		if err := ch.QueueBind(binding.queue, binding.routingKey, binding.exchange, false, nil); err != nil {
+		err := ch.QueueBind(
+			binding.queue, binding.routingKey, binding.exchange, false, nil,
+		)
+		if err != nil {
 			return err
 		}
 	}
@@ -258,11 +330,19 @@ func (c *Consumer) declareTopology(ch *amqp091.Channel) error {
 
 // handle processes one delivery and always leaves it either acked or untouched,
 // so a failed forward keeps the original message on the queue.
-func (c *Consumer) handle(ctx context.Context, delivery amqp091.Delivery, publisher publisher) error {
+func (c *Consumer) handle(
+	ctx context.Context,
+	delivery amqp091.Delivery,
+	publisher publisher,
+) error {
 	eventID, _ := uuid.Parse(delivery.MessageId)
 	eventType, _ := delivery.Headers["event_type"].(string)
 
-	_, err := c.processor.Process(ctx, eventID, eventType, delivery.Body)
+	c.metrics.RecordDelivery()
+	started := time.Now()
+	duplicate, err := c.processor.Process(ctx, eventID, eventType, delivery.Body)
+	c.metrics.RecordProcessing(time.Since(started), duplicate, err)
+
 	if err == nil {
 		c.logger.Info("event processed",
 			slog.String("event_id", eventID.String()),
@@ -270,33 +350,65 @@ func (c *Consumer) handle(ctx context.Context, delivery amqp091.Delivery, publis
 		// Process returns only after the notification transaction commits.
 		return delivery.Ack(false)
 	}
+	return c.handleFailure(ctx, delivery, publisher, deliveryFailure{
+		eventID:   eventID,
+		eventType: eventType,
+		err:       err,
+	})
+}
 
+func (c *Consumer) handleFailure(
+	ctx context.Context,
+	delivery amqp091.Delivery,
+	publisher publisher,
+	failure deliveryFailure,
+) error {
 	count, countErr := retryCount(delivery.Headers["x-retry-count"])
 
 	switch {
 	case countErr != nil,
-		errors.Is(err, ErrPermanent),
-		errors.Is(err, postgres.ErrInvalidTransferEvent):
-		return c.deadLetter(ctx, delivery, publisher, eventID, eventType, "permanent event error")
+		errors.Is(failure.err, ErrPermanent),
+		errors.Is(failure.err, postgres.ErrInvalidTransferEvent):
+		failure.reason = "permanent event error"
+		return c.deadLetter(ctx, delivery, publisher, failure)
 	case count >= c.settings.MaxRetries:
-		return c.deadLetter(ctx, delivery, publisher, eventID, eventType, "retry limit reached")
+		failure.reason = "retry limit reached"
+		return c.deadLetter(ctx, delivery, publisher, failure)
 	default:
-		return c.scheduleRetry(ctx, delivery, publisher, eventID, count)
+		failure.retryCount = count
+		return c.scheduleRetry(ctx, delivery, publisher, failure)
 	}
 }
 
-func (c *Consumer) deadLetter(ctx context.Context, delivery amqp091.Delivery, publisher publisher, eventID uuid.UUID, eventType, reason string) error {
+func (c *Consumer) deadLetter(
+	ctx context.Context,
+	delivery amqp091.Delivery,
+	publisher publisher,
+	failure deliveryFailure,
+) error {
 	c.logger.Warn("event sent to dead-letter queue",
-		slog.String("event_id", eventID.String()),
-		slog.String("event_type", eventType),
-		slog.String("reason", reason))
+		slog.String("event_id", failure.eventID.String()),
+		slog.String("event_type", failure.eventType),
+		slog.String("reason", failure.reason))
 
-	return c.forwardAndAck(ctx, delivery, publisher, c.settings.DeadLetterExchange, c.settings.DeadLetterRoutingKey, reason)
+	return c.forwardAndAck(
+		ctx, delivery, publisher,
+		forwardingTarget{
+			exchange:   c.settings.DeadLetterExchange,
+			routingKey: c.settings.DeadLetterRoutingKey,
+			reason:     failure.reason,
+		},
+	)
 }
 
-func (c *Consumer) scheduleRetry(ctx context.Context, delivery amqp091.Delivery, publisher publisher, eventID uuid.UUID, count int) error {
+func (c *Consumer) scheduleRetry(
+	ctx context.Context,
+	delivery amqp091.Delivery,
+	publisher publisher,
+	failure deliveryFailure,
+) error {
 	headers := copyHeaders(delivery.Headers)
-	headers["x-retry-count"] = int32(count + 1)
+	headers["x-retry-count"] = int32(failure.retryCount + 1)
 
 	message := amqp091.Publishing{
 		Headers:         headers,
@@ -308,19 +420,26 @@ func (c *Consumer) scheduleRetry(ctx context.Context, delivery amqp091.Delivery,
 		Type:            delivery.Type,
 		Body:            delivery.Body,
 	}
-	if err := publisher.Publish(ctx, c.settings.RetryExchange, c.settings.RoutingKey, message); err != nil {
+	if err := publisher.Publish(
+		ctx, c.settings.RetryExchange, c.settings.RoutingKey, message,
+	); err != nil {
 		return fmt.Errorf("publish retry: %w", err)
 	}
 
 	c.logger.Warn("event retry scheduled",
-		slog.String("event_id", eventID.String()),
-		slog.Int("retry_count", count+1))
+		slog.String("event_id", failure.eventID.String()),
+		slog.Int("retry_count", failure.retryCount+1))
 	return delivery.Ack(false)
 }
 
-func (c *Consumer) forwardAndAck(ctx context.Context, delivery amqp091.Delivery, publisher publisher, exchange, routingKey, reason string) error {
+func (c *Consumer) forwardAndAck(
+	ctx context.Context,
+	delivery amqp091.Delivery,
+	publisher publisher,
+	target forwardingTarget,
+) error {
 	headers := copyHeaders(delivery.Headers)
-	headers["x-failure-reason"] = reason
+	headers["x-failure-reason"] = target.reason
 
 	message := amqp091.Publishing{
 		Headers:      headers,
@@ -331,9 +450,10 @@ func (c *Consumer) forwardAndAck(ctx context.Context, delivery amqp091.Delivery,
 		Type:         delivery.Type,
 		Body:         delivery.Body,
 	}
-	if err := publisher.Publish(ctx, exchange, routingKey, message); err != nil {
+	if err := publisher.Publish(ctx, target.exchange, target.routingKey, message); err != nil {
 		return fmt.Errorf("publish dead-letter: %w", err)
 	}
+	c.metrics.RecordDeadLettered()
 	return delivery.Ack(false)
 }
 
@@ -378,7 +498,12 @@ type confirmedPublisher struct {
 	returns  <-chan amqp091.Return
 }
 
-func (p *confirmedPublisher) Publish(ctx context.Context, exchange, key string, message amqp091.Publishing) error {
+func (p *confirmedPublisher) Publish(
+	ctx context.Context,
+	exchange string,
+	key string,
+	message amqp091.Publishing,
+) error {
 	if err := p.channel.PublishWithContext(ctx, exchange, key, true, false, message); err != nil {
 		return err
 	}
@@ -409,7 +534,12 @@ type transferProcessor struct {
 
 // Process validates the message and records it. The bool result reports a
 // duplicate delivery, which is still a success.
-func (p *transferProcessor) Process(ctx context.Context, eventID uuid.UUID, eventType string, body []byte) (bool, error) {
+func (p *transferProcessor) Process(
+	ctx context.Context,
+	eventID uuid.UUID,
+	eventType string,
+	body []byte,
+) (bool, error) {
 	if eventID == uuid.Nil {
 		return false, fmt.Errorf("%w: invalid message ID", ErrPermanent)
 	}
