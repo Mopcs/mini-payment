@@ -3,6 +3,7 @@ package config
 import (
 	"errors"
 	"fmt"
+	"net"
 	"net/url"
 	"os"
 	"strconv"
@@ -49,6 +50,9 @@ type Config struct {
 	ConsumerMaxRetries           int
 	ConsumerPrefetchCount        int
 	ConsumerReconnectInterval    time.Duration
+	APIMetricsAddr               string
+	WorkerMetricsAddr            string
+	ConsumerMetricsAddr          string
 }
 
 // Load reads .env when it exists, then the environment, and validates every
@@ -76,6 +80,7 @@ func Load() (Config, error) {
 		loadBroker,
 		loadOutbox,
 		loadConsumer,
+		loadMetrics,
 	}
 	for _, load := range loaders {
 		if err := load(&cfg); err != nil {
@@ -84,6 +89,49 @@ func Load() (Config, error) {
 	}
 
 	return cfg, nil
+}
+
+func loadMetrics(cfg *Config) error {
+	addresses := []struct {
+		key      string
+		fallback string
+		target   *string
+	}{
+		{key: "API_METRICS_ADDR", fallback: "127.0.0.1:9091", target: &cfg.APIMetricsAddr},
+		{key: "WORKER_METRICS_ADDR", fallback: "127.0.0.1:9092", target: &cfg.WorkerMetricsAddr},
+		{key: "CONSUMER_METRICS_ADDR", fallback: "127.0.0.1:9093", target: &cfg.ConsumerMetricsAddr},
+	}
+	seenPorts := make(map[int]string, len(addresses))
+	appPort, err := validateListenAddress("APP_ADDR", cfg.AppAddr)
+	if err != nil {
+		return err
+	}
+	seenPorts[appPort] = "APP_ADDR"
+	for _, address := range addresses {
+		value := strings.TrimSpace(envOrDefault(address.key, address.fallback))
+		port, err := validateListenAddress(address.key, value)
+		if err != nil {
+			return err
+		}
+		if previous, exists := seenPorts[port]; exists {
+			return fmt.Errorf("%s and %s must use different ports", address.key, previous)
+		}
+		seenPorts[port] = address.key
+		*address.target = value
+	}
+	return nil
+}
+
+func validateListenAddress(key, address string) (int, error) {
+	_, portText, err := net.SplitHostPort(address)
+	if err != nil {
+		return 0, fmt.Errorf("%s must be a valid host:port address", key)
+	}
+	port, err := strconv.Atoi(portText)
+	if err != nil || port < 1 || port > 65535 {
+		return 0, fmt.Errorf("%s port must be between 1 and 65535", key)
+	}
+	return port, nil
 }
 
 // loadConnections validates the PostgreSQL and Redis endpoints.
@@ -157,14 +205,16 @@ func loadBroker(cfg *Config) error {
 	}
 
 	cfg.RabbitMQURL = brokerURL
-	cfg.RabbitMQExchange = strings.TrimSpace(envOrDefault("RABBITMQ_EXCHANGE", "payment.events"))
-	cfg.RabbitMQQueue = strings.TrimSpace(envOrDefault("RABBITMQ_QUEUE", "payment.events"))
-	cfg.RabbitMQRoutingKey = strings.TrimSpace(envOrDefault("RABBITMQ_ROUTING_KEY", "transfer.completed"))
-	cfg.RabbitMQRetryExchange = strings.TrimSpace(envOrDefault("RABBITMQ_RETRY_EXCHANGE", "payment.events.retry"))
-	cfg.RabbitMQRetryQueue = strings.TrimSpace(envOrDefault("RABBITMQ_RETRY_QUEUE", "payment.events.retry"))
-	cfg.RabbitMQDeadLetterExchange = strings.TrimSpace(envOrDefault("RABBITMQ_DEAD_LETTER_EXCHANGE", "payment.events.dlx"))
-	cfg.RabbitMQDeadLetterQueue = strings.TrimSpace(envOrDefault("RABBITMQ_DEAD_LETTER_QUEUE", "payment.events.dlq"))
-	cfg.RabbitMQDeadLetterRoutingKey = strings.TrimSpace(envOrDefault("RABBITMQ_DEAD_LETTER_ROUTING_KEY", "transfer.completed.dlq"))
+	cfg.RabbitMQExchange = trimmedEnv("RABBITMQ_EXCHANGE", "payment.events")
+	cfg.RabbitMQQueue = trimmedEnv("RABBITMQ_QUEUE", "payment.events")
+	cfg.RabbitMQRoutingKey = trimmedEnv("RABBITMQ_ROUTING_KEY", "transfer.completed")
+	cfg.RabbitMQRetryExchange = trimmedEnv("RABBITMQ_RETRY_EXCHANGE", "payment.events.retry")
+	cfg.RabbitMQRetryQueue = trimmedEnv("RABBITMQ_RETRY_QUEUE", "payment.events.retry")
+	cfg.RabbitMQDeadLetterExchange = trimmedEnv("RABBITMQ_DEAD_LETTER_EXCHANGE", "payment.events.dlx")
+	cfg.RabbitMQDeadLetterQueue = trimmedEnv("RABBITMQ_DEAD_LETTER_QUEUE", "payment.events.dlq")
+	cfg.RabbitMQDeadLetterRoutingKey = trimmedEnv(
+		"RABBITMQ_DEAD_LETTER_ROUTING_KEY", "transfer.completed.dlq",
+	)
 	cfg.RabbitMQRetryDelay = retryDelay
 
 	if cfg.RabbitMQExchange == "" || cfg.RabbitMQQueue == "" || cfg.RabbitMQRoutingKey == "" ||
@@ -245,6 +295,10 @@ func envOrDefault(key, fallback string) string {
 		return value
 	}
 	return fallback
+}
+
+func trimmedEnv(key, fallback string) string {
+	return strings.TrimSpace(envOrDefault(key, fallback))
 }
 
 func requiredEnv(key string) (string, error) {

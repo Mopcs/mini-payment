@@ -16,11 +16,41 @@ func TestLoadDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load() error = %v", err)
 	}
-	if cfg.AppAddr != ":8080" || cfg.PostgresHost != "localhost" || cfg.PostgresPort != 5432 || cfg.PostgresDB != "payment_db" || cfg.PostgresUser != "payment_user" || cfg.RedisHost != "localhost" || cfg.RedisPort != 6379 || cfg.LogLevel != "info" || cfg.JWTIssuer != "mini-payment-system" || cfg.JWTAccessTokenTTL != 15*time.Minute || cfg.RabbitMQExchange != "payment.events" || cfg.RabbitMQQueue != "payment.events" || cfg.RabbitMQRoutingKey != "transfer.completed" || cfg.OutboxBatchSize != 20 || cfg.OutboxPollInterval != time.Second || cfg.OutboxLeaseDuration != 30*time.Second || cfg.OutboxMaxBackoff != 5*time.Minute {
-		t.Fatal("configuration defaults were not applied")
-	}
+	assertDefaultValues(t, cfg)
 	if cfg.RabbitMQURL == "" {
 		t.Fatal("local RabbitMQ URL default was not applied")
+	}
+}
+
+func assertDefaultValues(t *testing.T, cfg Config) {
+	t.Helper()
+	values := []struct {
+		name string
+		got  any
+		want any
+	}{
+		{"AppAddr", cfg.AppAddr, ":8080"},
+		{"PostgresHost", cfg.PostgresHost, "localhost"},
+		{"PostgresPort", cfg.PostgresPort, uint16(5432)},
+		{"PostgresDB", cfg.PostgresDB, "payment_db"},
+		{"PostgresUser", cfg.PostgresUser, "payment_user"},
+		{"RedisHost", cfg.RedisHost, "localhost"},
+		{"RedisPort", cfg.RedisPort, uint16(6379)},
+		{"LogLevel", cfg.LogLevel, "info"},
+		{"JWTIssuer", cfg.JWTIssuer, "mini-payment-system"},
+		{"JWTAccessTokenTTL", cfg.JWTAccessTokenTTL, 15 * time.Minute},
+		{"RabbitMQExchange", cfg.RabbitMQExchange, "payment.events"},
+		{"RabbitMQQueue", cfg.RabbitMQQueue, "payment.events"},
+		{"RabbitMQRoutingKey", cfg.RabbitMQRoutingKey, "transfer.completed"},
+		{"OutboxBatchSize", cfg.OutboxBatchSize, 20},
+		{"OutboxPollInterval", cfg.OutboxPollInterval, time.Second},
+		{"OutboxLeaseDuration", cfg.OutboxLeaseDuration, 30 * time.Second},
+		{"OutboxMaxBackoff", cfg.OutboxMaxBackoff, 5 * time.Minute},
+	}
+	for _, value := range values {
+		if value.got != value.want {
+			t.Errorf("%s = %v, want %v", value.name, value.got, value.want)
+		}
 	}
 }
 
@@ -48,6 +78,60 @@ func TestLoadRejectsInvalidWorkerConfiguration(t *testing.T) {
 	}
 }
 
+func TestLoadMetricsDefaults(t *testing.T) {
+	withCleanEnvironment(t)
+	setRequiredTestConfiguration(t)
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.APIMetricsAddr != "127.0.0.1:9091" ||
+		cfg.WorkerMetricsAddr != "127.0.0.1:9092" ||
+		cfg.ConsumerMetricsAddr != "127.0.0.1:9093" {
+		t.Fatalf("metrics defaults = %q, %q, %q", cfg.APIMetricsAddr,
+			cfg.WorkerMetricsAddr, cfg.ConsumerMetricsAddr)
+	}
+}
+
+func TestLoadRejectsInvalidOrDuplicateMetricsAddresses(t *testing.T) {
+	tests := []struct {
+		name     string
+		api      string
+		worker   string
+		consumer string
+	}{
+		{name: "invalid port", api: "127.0.0.1:0"},
+		{name: "API port conflict", api: "127.0.0.1:8080"},
+		{name: "duplicate port", api: "127.0.0.1:9091", worker: "0.0.0.0:9091"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			withCleanEnvironment(t)
+			setRequiredTestConfiguration(t)
+			if test.api != "" {
+				t.Setenv("API_METRICS_ADDR", test.api)
+			}
+			if test.worker != "" {
+				t.Setenv("WORKER_METRICS_ADDR", test.worker)
+			}
+			if test.consumer != "" {
+				t.Setenv("CONSUMER_METRICS_ADDR", test.consumer)
+			}
+			if _, err := Load(); err == nil {
+				t.Fatal("Load() accepted invalid metrics addresses")
+			}
+		})
+	}
+}
+
+func setRequiredTestConfiguration(t *testing.T) {
+	t.Helper()
+	t.Setenv("POSTGRES_PASSWORD", "postgres-test")
+	t.Setenv("REDIS_PASSWORD", "redis-test")
+	t.Setenv("JWT_SECRET", "test-jwt-secret-with-at-least-32-bytes")
+}
+
 func TestLoadRequiresPasswords(t *testing.T) {
 	withCleanEnvironment(t)
 	t.Setenv("POSTGRES_PASSWORD", "postgres-test")
@@ -60,7 +144,8 @@ func TestLoadRequiresPasswords(t *testing.T) {
 
 func TestEnvironmentOverridesDotEnv(t *testing.T) {
 	withCleanEnvironment(t)
-	if err := os.WriteFile(".env", []byte("APP_ADDR=:9090\nPOSTGRES_PASSWORD=from-file\nREDIS_PASSWORD=redis-file\n"), 0600); err != nil {
+	contents := "APP_ADDR=:9090\nPOSTGRES_PASSWORD=from-file\nREDIS_PASSWORD=redis-file\n"
+	if err := os.WriteFile(".env", []byte(contents), 0600); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("APP_ADDR", ":7070")
@@ -91,36 +176,54 @@ func TestLoadRequiresStrongJWTSecret(t *testing.T) {
 
 func withCleanEnvironment(t *testing.T) {
 	t.Helper()
-	for _, key := range []string{
-		"APP_ADDR", "POSTGRES_HOST", "POSTGRES_PORT", "POSTGRES_DB", "POSTGRES_USER", "POSTGRES_PASSWORD",
-		"REDIS_HOST", "REDIS_PORT", "REDIS_PASSWORD", "LOG_LEVEL", "JWT_SECRET", "JWT_ISSUER", "JWT_ACCESS_TOKEN_TTL",
-		"RABBITMQ_URL", "RABBITMQ_USER", "RABBITMQ_PASSWORD", "RABBITMQ_EXCHANGE", "RABBITMQ_QUEUE", "RABBITMQ_ROUTING_KEY",
-		"OUTBOX_BATCH_SIZE", "OUTBOX_POLL_INTERVAL", "OUTBOX_LEASE_DURATION", "OUTBOX_MAX_BACKOFF",
-	} {
-		original, hadValue := os.LookupEnv(key)
-		if err := os.Unsetenv(key); err != nil {
-			t.Fatal(err)
-		}
-		t.Cleanup(func() {
-			if hadValue {
-				_ = os.Setenv(key, original)
-			} else {
-				_ = os.Unsetenv(key)
-			}
-		})
-	}
-
+	clearEnvironment(t)
 	previousDir, err := os.Getwd()
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Chdir(t.TempDir())
-	t.Cleanup(func() {
-		if err := os.Chdir(previousDir); err != nil {
-			t.Errorf("restore working directory: %v", err)
-		}
-	})
+	t.Cleanup(func() { restoreDirectory(t, previousDir) })
 	if _, err := os.Stat(".env"); !os.IsNotExist(err) {
 		t.Fatalf("temporary directory unexpectedly contains .env: %v", err)
+	}
+}
+
+func clearEnvironment(t *testing.T) {
+	t.Helper()
+	for _, key := range environmentKeys() {
+		original, hadValue := os.LookupEnv(key)
+		if err := os.Unsetenv(key); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(environmentRestore(key, original, hadValue))
+	}
+}
+func environmentRestore(key, value string, hadValue bool) func() {
+	return func() {
+		if hadValue {
+			_ = os.Setenv(key, value)
+			return
+		}
+		_ = os.Unsetenv(key)
+	}
+}
+
+func restoreDirectory(t *testing.T, previousDir string) {
+	if err := os.Chdir(previousDir); err != nil {
+		t.Errorf("restore working directory: %v", err)
+	}
+}
+
+func environmentKeys() []string {
+	return []string{
+		"APP_ADDR", "POSTGRES_HOST", "POSTGRES_PORT", "POSTGRES_DB", "POSTGRES_USER",
+		"POSTGRES_PASSWORD", "REDIS_HOST", "REDIS_PORT", "REDIS_PASSWORD", "LOG_LEVEL",
+		"JWT_SECRET", "JWT_ISSUER", "JWT_ACCESS_TOKEN_TTL", "RABBITMQ_URL", "RABBITMQ_USER",
+		"RABBITMQ_PASSWORD", "RABBITMQ_EXCHANGE", "RABBITMQ_QUEUE", "RABBITMQ_ROUTING_KEY",
+		"RABBITMQ_RETRY_EXCHANGE", "RABBITMQ_RETRY_QUEUE", "RABBITMQ_DEAD_LETTER_EXCHANGE",
+		"RABBITMQ_DEAD_LETTER_QUEUE", "RABBITMQ_DEAD_LETTER_ROUTING_KEY", "RABBITMQ_RETRY_DELAY",
+		"CONSUMER_MAX_RETRIES", "CONSUMER_PREFETCH_COUNT", "CONSUMER_RECONNECT_INTERVAL",
+		"API_METRICS_ADDR", "WORKER_METRICS_ADDR", "CONSUMER_METRICS_ADDR",
+		"OUTBOX_BATCH_SIZE", "OUTBOX_POLL_INTERVAL", "OUTBOX_LEASE_DURATION", "OUTBOX_MAX_BACKOFF",
 	}
 }

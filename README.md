@@ -225,3 +225,38 @@ $env:OUTBOX_TEST_DATABASE_URL = 'postgres://payment_user:test-only-password@127.
 go test ./internal/worker/outbox -count=1
 go test -race ./internal/worker/outbox -count=1
 ```
+
+## Prometheus metrics
+
+The API, outbox worker, and transfer consumer each start a separate metrics
+listener. The defaults bind to loopback so they are not exposed to other
+machines:
+
+| Process | Address | Metrics |
+| --- | --- | --- |
+| API | `127.0.0.1:9091/metrics` | HTTP request totals, duration, in-progress requests |
+| Worker | `127.0.0.1:9092/metrics` | Claimed and published events, publish failures, retries, active jobs, oldest pending age |
+| Consumer | `127.0.0.1:9093/metrics` | Deliveries, processed and duplicate events, failures, dead letters, processing duration |
+
+All processes also expose Go runtime and process metrics. The worker and
+consumer expose pgxpool connection state and acquisition statistics.
+
+Set `API_METRICS_ADDR`, `WORKER_METRICS_ADDR`, and `CONSUMER_METRICS_ADDR` to
+change the listen addresses. Each address must be a valid, distinct `host:port`.
+For Prometheus running on the same machine, the defaults in
+[`prometheus.yml`](prometheus.yml) are ready to use. If Prometheus runs in a
+container, bind metrics to a private interface reachable from that container
+and update the scrape targets accordingly.
+
+Start each application process separately:
+
+```powershell
+go run ./cmd/api
+go run ./cmd/worker
+go run ./cmd/consumer
+```
+
+Metrics include operational details such as route patterns and queue health.
+Keep the listener on loopback or a trusted private network. When metrics must
+cross an untrusted network, put them behind an authenticated proxy or network
+access control; do not expose these ports publicly.
