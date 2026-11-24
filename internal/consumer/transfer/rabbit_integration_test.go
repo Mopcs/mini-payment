@@ -64,6 +64,7 @@ func TestRabbitMQDeliveryIntegration(t *testing.T) {
 		t.Fatal(err)
 	}
 	confirms := channel.NotifyPublish(make(chan amqp091.Confirmation, 1))
+	returns := channel.NotifyReturn(make(chan amqp091.Return, 1))
 
 	ctx, cancel := context.WithCancel(context.Background())
 	consumerDone := make(chan error, 1)
@@ -77,7 +78,7 @@ func TestRabbitMQDeliveryIntegration(t *testing.T) {
 		}
 		cleanupRabbitTopology(t, brokerURL, settings)
 	})
-	waitForQueue(t, brokerURL, settings.Queue)
+	waitForConsumer(t, brokerURL, settings.Queue)
 
 	for _, eventType := range []string{"temporary.test", "permanent.test"} {
 		id := uuid.NewString()
@@ -95,6 +96,13 @@ func TestRabbitMQDeliveryIntegration(t *testing.T) {
 		case <-time.After(5 * time.Second):
 			t.Fatal("test publish was not confirmed")
 		}
+		// A returned message would otherwise surface only as a confusing timeout.
+		select {
+		case returned := <-returns:
+			t.Fatalf("test message was unroutable (code %d): %s",
+				returned.ReplyCode, returned.ReplyText)
+		default:
+		}
 		if eventType == "temporary.test" {
 			waitFor(t, 5*time.Second, func() bool { return processor.attempts.Load() >= 2 })
 		} else {
@@ -109,7 +117,11 @@ func TestRabbitMQDeliveryIntegration(t *testing.T) {
 	}
 }
 
-func waitForQueue(t *testing.T, brokerURL, queue string) {
+// waitForConsumer blocks until the queue exists and a consumer is attached.
+// Waiting for the queue alone is not enough: the consumer declares the queue
+// before it creates the bindings and starts consuming, so an early publish is
+// returned as unroutable and the test never sees the message.
+func waitForConsumer(t *testing.T, brokerURL, queue string) {
 	t.Helper()
 	waitFor(t, 5*time.Second, func() bool {
 		conn, err := amqp091.Dial(brokerURL)
@@ -122,8 +134,8 @@ func waitForQueue(t *testing.T, brokerURL, queue string) {
 			return false
 		}
 		defer ch.Close()
-		_, err = ch.QueueDeclarePassive(queue, true, false, false, false, nil)
-		return err == nil
+		state, err := ch.QueueDeclarePassive(queue, true, false, false, false, nil)
+		return err == nil && state.Consumers > 0
 	})
 }
 
