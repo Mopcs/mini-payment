@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/Mopcs/mini-payment-system/internal/domain"
 	transferservice "github.com/Mopcs/mini-payment-system/internal/service/transfer"
@@ -64,6 +65,7 @@ func TestTransferIntegration(t *testing.T) {
 		t.Fatalf("transfer ledger count=%d total=%d source=%d destination=%d err=%v", entryCount, entryTotal, sourceEntry, destinationEntry, err)
 	}
 	assertWalletBalances(t, wallets, sourceUser.ID, sourceWallet.ID, destinationUser.ID, destinationWallet.ID, 7500, 2500)
+	assertTransferFinancialInvariants(t, pool, sourceWallet.ID, destinationWallet.ID, 10_000, 1)
 
 	if _, _, err := transfers.Transfer(context.Background(), sourceUser.ID, sourceWallet.ID, sourceWallet.ID, 1, "USD", "same-"+uuid.NewString()); !errors.Is(err, transferservice.ErrSameWallet) {
 		t.Fatalf("same-wallet transfer error = %v", err)
@@ -110,9 +112,11 @@ func TestTransferIntegration(t *testing.T) {
 	if err := pool.QueryRow(context.Background(), `SELECT count(*) FROM ledger_transactions WHERE user_id = $1 AND idempotency_key = $2`, sourceUser.ID, rollbackKey).Scan(&failedKeyCount); err != nil || failedKeyCount != 0 {
 		t.Fatalf("rolled-back transfer retained idempotency row: count=%d err=%v", failedKeyCount, err)
 	}
+	assertTransferFinancialInvariants(t, pool, sourceWallet.ID, destinationWallet.ID, 10_000, 1)
 
 	runOppositeDirectionTransfers(t, transfers, sourceUser.ID, destinationUser.ID, sourceWallet.ID, destinationWallet.ID)
 	assertWalletBalances(t, wallets, sourceUser.ID, sourceWallet.ID, destinationUser.ID, destinationWallet.ID, 7500, 2500)
+	assertTransferFinancialInvariants(t, pool, sourceWallet.ID, destinationWallet.ID, 10_000, 17)
 
 	const parallelRequests = 8
 	parallelKey := "same-key-" + uuid.NewString()
@@ -149,19 +153,11 @@ func TestTransferIntegration(t *testing.T) {
 			t.Fatalf("duplicate result differs: %+v / %+v", result, parallelResults[0])
 		}
 	}
+	assertWalletBalances(t, wallets, sourceUser.ID, sourceWallet.ID, destinationUser.ID, destinationWallet.ID, 7400, 2600)
+	assertTransferFinancialInvariants(t, pool, sourceWallet.ID, destinationWallet.ID, 10_000, 18)
 
-	runConcurrentSourceTransfers(t, transfers, wallets, sourceUser.ID, destinationUser.ID, sourceWallet.ID, destinationWallet.ID, 7400, 10_000)
-	var invalidTransferCount int
-	if err := pool.QueryRow(context.Background(), `
-		SELECT count(*) FROM (
-			SELECT t.id FROM ledger_transactions t
-			JOIN ledger_entries le ON le.transaction_id = t.id
-			WHERE t.transaction_type = 'transfer' AND t.user_id = $1
-			GROUP BY t.id HAVING count(*) <> 2 OR sum(le.amount) <> 0
-		) invalid`, sourceUser.ID,
-	).Scan(&invalidTransferCount); err != nil || invalidTransferCount != 0 {
-		t.Fatalf("invalid transfer ledger rows=%d err=%v", invalidTransferCount, err)
-	}
+	successes := runConcurrentSourceTransfers(t, transfers, wallets, sourceUser.ID, destinationUser.ID, sourceWallet.ID, destinationWallet.ID, 7400, 10_000)
+	assertTransferFinancialInvariants(t, pool, sourceWallet.ID, destinationWallet.ID, 10_000, 18+successes)
 }
 
 func runOppositeDirectionTransfers(t *testing.T, service *transferservice.Service, sourceUserID, destinationUserID, sourceWalletID, destinationWalletID uuid.UUID) {
@@ -194,7 +190,7 @@ func runOppositeDirectionTransfers(t *testing.T, service *transferservice.Servic
 	}
 }
 
-func runConcurrentSourceTransfers(t *testing.T, service *transferservice.Service, wallets *Service, sourceUserID, destinationUserID, sourceWalletID, destinationWalletID uuid.UUID, startingSource, totalBalance int64) {
+func runConcurrentSourceTransfers(t *testing.T, service *transferservice.Service, wallets *Service, sourceUserID, destinationUserID, sourceWalletID, destinationWalletID uuid.UUID, startingSource, totalBalance int64) int {
 	t.Helper()
 	const attempts = 16
 	var wg sync.WaitGroup
@@ -232,6 +228,55 @@ func runConcurrentSourceTransfers(t *testing.T, service *transferservice.Service
 	destination, err := wallets.Get(context.Background(), destinationUserID, destinationWalletID)
 	if err != nil || source.Balance+destination.Balance != totalBalance {
 		t.Fatalf("wallet balance was not conserved: source=%+v destination=%+v err=%v", source, destination, err)
+	}
+	return successes
+}
+
+func assertTransferFinancialInvariants(t *testing.T, pool *pgxpool.Pool, firstWalletID, secondWalletID uuid.UUID, expectedTotal int64, expectedTransfers int) {
+	t.Helper()
+	var walletCount, negativeBalances int
+	var walletTotal int64
+	if err := pool.QueryRow(context.Background(), `
+		SELECT count(*), count(*) FILTER (WHERE balance < 0), COALESCE(sum(balance), 0)
+		FROM wallets WHERE id IN ($1, $2)`, firstWalletID, secondWalletID,
+	).Scan(&walletCount, &negativeBalances, &walletTotal); err != nil {
+		t.Fatalf("query transfer wallet invariants: %v", err)
+	}
+	if walletCount != 2 || negativeBalances != 0 || walletTotal != expectedTotal {
+		t.Fatalf("wallet invariant: count=%d negative=%d total=%d, want count=2 negative=0 total=%d", walletCount, negativeBalances, walletTotal, expectedTotal)
+	}
+
+	var transferCount, ledgerEntryCount, invalidLedgerCount int
+	if err := pool.QueryRow(context.Background(), `
+		SELECT count(*) FROM ledger_transactions
+		WHERE transaction_type = 'transfer'
+		  AND (wallet_id IN ($1, $2) OR destination_wallet_id IN ($1, $2))`, firstWalletID, secondWalletID,
+	).Scan(&transferCount); err != nil {
+		t.Fatalf("count completed transfers: %v", err)
+	}
+	if err := pool.QueryRow(context.Background(), `
+		SELECT count(*) FROM ledger_entries le
+		JOIN ledger_transactions t ON t.id = le.transaction_id
+		WHERE t.transaction_type = 'transfer'
+		  AND (t.wallet_id IN ($1, $2) OR t.destination_wallet_id IN ($1, $2))`, firstWalletID, secondWalletID,
+	).Scan(&ledgerEntryCount); err != nil {
+		t.Fatalf("count transfer ledger entries: %v", err)
+	}
+	if err := pool.QueryRow(context.Background(), `
+		SELECT count(*) FROM (
+			SELECT t.id FROM ledger_transactions t
+			LEFT JOIN ledger_entries le ON le.transaction_id = t.id
+			LEFT JOIN ledger_accounts la ON la.id = le.account_id
+			WHERE t.transaction_type = 'transfer'
+			  AND (t.wallet_id IN ($1, $2) OR t.destination_wallet_id IN ($1, $2))
+			GROUP BY t.id
+			HAVING count(le.id) <> 2 OR COALESCE(sum(le.amount), 0) <> 0 OR count(DISTINCT la.currency) <> 1
+		) invalid`, firstWalletID, secondWalletID,
+	).Scan(&invalidLedgerCount); err != nil {
+		t.Fatalf("validate transfer ledger entries: %v", err)
+	}
+	if transferCount != expectedTransfers || ledgerEntryCount != expectedTransfers*2 || invalidLedgerCount != 0 {
+		t.Fatalf("ledger invariant: transfers=%d entries=%d invalid=%d; want transfers=%d entries=%d invalid=0", transferCount, ledgerEntryCount, invalidLedgerCount, expectedTransfers, expectedTransfers*2)
 	}
 }
 

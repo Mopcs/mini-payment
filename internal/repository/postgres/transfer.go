@@ -66,6 +66,7 @@ func (r *TransferRepository) Create(ctx context.Context, userID, sourceID, desti
 		return existing, true, nil
 	}
 
+	// Lock wallets in UUID order so opposite-direction transfers use the same order.
 	lockOrder := []uuid.UUID{sourceID, destinationID}
 	if bytes.Compare(lockOrder[0][:], lockOrder[1][:]) > 0 {
 		lockOrder[0], lockOrder[1] = lockOrder[1], lockOrder[0]

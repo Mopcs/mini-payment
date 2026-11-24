@@ -79,3 +79,24 @@ Send a positive integer `amount` in the currency's smallest unit and a matching 
 Each wallet has a ledger account, created by the database when the wallet is inserted; existing wallets receive accounts when migration 3 is applied. The corresponding system funding accounts are seeded for each supported currency. Deposits update the wallet and create equal positive wallet and negative funding entries in one transaction. Ledger entries are append-only; represent any correction with a compensating transaction rather than editing history. Migration 3's down migration refuses to remove the ledger schema while ledger entries exist.
 
 `POST /api/v1/transfers` moves a positive integer amount between two wallets of the same currency. The authenticated user must own the source wallet; the destination can belong to another user. Transfers use the same per-user `Idempotency-Key` table as deposits, and reject a key reused for a different operation or payload. Both wallet rows are locked in UUID order, then the balances and two wallet ledger entries are committed together. Transfers do not use a system funding account. Migration 4's down migration refuses to remove transfer support while transfer records exist.
+
+## Integration tests
+
+PostgreSQL integration tests use `TEST_DATABASE_URL` and require a dedicated database whose name ends in `_test`; the test helper rejects other database names. Create that database separately and apply all migrations to it before running the tests. Never point `TEST_DATABASE_URL` or the migration command at the development database for test runs.
+
+Example for PowerShell (adjust the host, port, username, and test-only credentials for your isolated PostgreSQL instance):
+
+```powershell
+$env:POSTGRES_HOST = '127.0.0.1'
+$env:POSTGRES_PORT = '5433'
+$env:POSTGRES_DB = 'payment_test'
+$env:POSTGRES_USER = 'payment_user'
+$env:POSTGRES_PASSWORD = 'test-only-password'
+go run ./cmd/migrate up
+$env:TEST_DATABASE_URL = 'postgres://payment_user:test-only-password@127.0.0.1:5433/payment_test?sslmode=disable'
+go test ./...
+go test -race ./...
+go vet ./...
+```
+
+The transfer integration suite covers concurrent transfers from one funded wallet, transfers running in opposite directions, identical concurrent idempotency requests, conflicting reuse of a key, and rollback after a ledger write fails. It checks that balances stay non-negative, wallet totals are conserved, failed requests leave no transfer record, and every completed transfer has exactly two ledger entries whose amounts sum to zero. The race detector checks Go memory races; PostgreSQL concurrency behavior is checked by the integration tests against the dedicated database.
