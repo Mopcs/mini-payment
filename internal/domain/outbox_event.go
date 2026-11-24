@@ -14,6 +14,7 @@ type OutboxEvent struct {
 	AggregateType string
 	EventType     string
 	Payload       TransferCompletedPayload
+	Attempts      int
 }
 
 type TransferCompletedPayload struct {

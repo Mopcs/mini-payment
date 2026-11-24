@@ -22,7 +22,7 @@ type TransferRepository struct {
 }
 
 func NewTransferRepository(pool *pgxpool.Pool) *TransferRepository {
-	return &TransferRepository{pool: pool, outbox: NewOutboxRepository()}
+	return &TransferRepository{pool: pool, outbox: NewOutboxRepository(pool)}
 }
 
 func (r *TransferRepository) List(ctx context.Context, userID uuid.UUID, filter domain.TransferHistoryFilter) ([]domain.TransferHistoryItem, int64, error) {
