@@ -5,19 +5,41 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/Mopcs/mini-payment-system/internal/observability"
 	"github.com/Mopcs/mini-payment-system/internal/transport/http/handlers"
 	"github.com/Mopcs/mini-payment-system/internal/transport/http/middleware"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
-func NewServer(addr string, postgres, redis handlers.Dependency, authService handlers.AuthService, walletService handlers.WalletService, transferService handlers.TransferService, tokens middleware.TokenValidator, logger *slog.Logger) *http.Server {
+type ServerConfig struct {
+	Address         string
+	Postgres        handlers.Dependency
+	Redis           handlers.Dependency
+	AuthService     handlers.AuthService
+	WalletService   handlers.WalletService
+	TransferService handlers.TransferService
+	Tokens          middleware.TokenValidator
+	Logger          *slog.Logger
+	Registry        *prometheus.Registry
+	Metrics         *observability.HTTPMetrics
+}
+
+func NewServer(config ServerConfig) *http.Server {
 	mux := http.NewServeMux()
-	handlers.NewHealth(postgres, redis, logger).Register(mux)
-	handlers.NewAuth(authService, logger).Register(mux)
-	handlers.NewWallet(walletService, logger).Register(mux, tokens)
-	handlers.NewTransfers(transferService, logger).Register(mux, tokens)
+	registerRoutes(mux, config)
+	mux.Handle("GET /metrics", promhttp.HandlerFor(config.Registry, promhttp.HandlerOpts{}))
+
 	return &http.Server{
-		Addr:              addr,
-		Handler:           mux,
+		Addr:              config.Address,
+		Handler:           config.Metrics.Instrument(mux),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
+}
+
+func registerRoutes(mux *http.ServeMux, config ServerConfig) {
+	handlers.NewHealth(config.Postgres, config.Redis, config.Logger).Register(mux)
+	handlers.NewAuth(config.AuthService, config.Logger).Register(mux)
+	handlers.NewWallet(config.WalletService, config.Logger).Register(mux, config.Tokens)
+	handlers.NewTransfers(config.TransferService, config.Logger).Register(mux, config.Tokens)
 }
