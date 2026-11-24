@@ -17,11 +17,12 @@ import (
 )
 
 type TransferRepository struct {
-	pool *pgxpool.Pool
+	pool   *pgxpool.Pool
+	outbox *OutboxRepository
 }
 
 func NewTransferRepository(pool *pgxpool.Pool) *TransferRepository {
-	return &TransferRepository{pool: pool}
+	return &TransferRepository{pool: pool, outbox: NewOutboxRepository()}
 }
 
 func (r *TransferRepository) List(ctx context.Context, userID uuid.UUID, filter domain.TransferHistoryFilter) ([]domain.TransferHistoryItem, int64, error) {
@@ -238,6 +239,22 @@ func (r *TransferRepository) Create(ctx context.Context, userID, sourceID, desti
 		SourceBalanceAfter:      sourceBalanceAfter,
 		DestinationBalanceAfter: destinationBalanceAfter,
 		CreatedAt:               createdAt,
+	}
+	if err := r.outbox.Create(ctx, tx, domain.OutboxEvent{
+		ID:            uuid.New(),
+		AggregateID:   transactionID,
+		AggregateType: "transfer",
+		EventType:     domain.EventTypeTransferCompleted,
+		Payload: domain.TransferCompletedPayload{
+			TransferID:          transactionID,
+			SourceWalletID:      sourceID,
+			DestinationWalletID: destinationID,
+			Amount:              amount,
+			Currency:            currency,
+			CompletedAt:         createdAt,
+		},
+	}); err != nil {
+		return domain.Transfer{}, false, err
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return domain.Transfer{}, false, translateError("commit transfer transaction", err)
