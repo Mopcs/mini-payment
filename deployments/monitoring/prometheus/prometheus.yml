@@ -1,0 +1,38 @@
+# Prometheus configuration for the Mini Payment System.
+#
+# The Go processes run on the host (go run ./cmd/api|worker|consumer) and each
+# one listens on its own metrics port:
+#   api       -> 9091  (API_METRICS_ADDR)
+#   worker    -> 9092  (WORKER_METRICS_ADDR)
+#   consumer  -> 9093  (CONSUMER_METRICS_ADDR)
+#
+# Prometheus runs in Docker, so it reaches those ports through the host gateway.
+# If the applications are containerised later, replace host.docker.internal
+# with the Compose service name, for example api:9091.
+
+global:
+  scrape_interval: 15s
+  scrape_timeout: 10s
+  evaluation_interval: 15s
+  external_labels:
+    monitor: mini-payment-system
+
+scrape_configs:
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]
+
+  - job_name: payment-api
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["host.docker.internal:9091"]
+
+  - job_name: payment-worker
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["host.docker.internal:9092"]
+
+  - job_name: payment-consumer
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["host.docker.internal:9093"]
