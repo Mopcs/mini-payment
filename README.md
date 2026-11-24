@@ -1,4 +1,4 @@
-# Mini Payment Processing System
+ az# Mini Payment Processing System
 
 A Go modular monolith for processing payments between users. PostgreSQL is the source of truth for financial data; Redis is reserved for supporting features such as caching and rate limiting.
 
@@ -128,3 +128,28 @@ go vet ./...
 ```
 
 The transfer integration suite covers concurrent transfers from one funded wallet, transfers running in opposite directions, identical concurrent idempotency requests, conflicting reuse of a key, and rollback after a ledger write fails. It checks that balances stay non-negative, wallet totals are conserved, failed requests leave no transfer record, and every completed transfer has exactly two ledger entries whose amounts sum to zero. The race detector checks Go memory races; PostgreSQL concurrency behavior is checked by the integration tests against the dedicated database.
+
+## Transactional outbox
+
+The transactional outbox prevents a committed transfer from being lost between saving it and later notifying other systems. A `transfer.completed` event is inserted in the same PostgreSQL transaction as wallet balance updates, the transfer ledger record, ledger entries, and the idempotency result. If any part fails, PostgreSQL rolls the entire transaction back. This iteration persists events only; it does not publish them to an external broker.
+
+Migration 5 creates `outbox_events` with:
+
+- `id` (UUID primary key), `aggregate_id` (the transfer UUID), and `aggregate_type` (`transfer`).
+- `event_type` (currently `transfer.completed`) and `payload` (a JSON object).
+- `created_at`, nullable `published_at`, non-negative `attempts` defaulting to zero, and nullable `last_error`.
+
+The partial `outbox_events_unpublished_poll_idx` index orders unpublished rows by creation time and ID for future polling. `outbox_events_aggregate_id_idx` supports looking up events for an aggregate. The transfer payload is:
+
+```json
+{
+  "transfer_id": "transfer-uuid",
+  "source_wallet_id": "source-wallet-uuid",
+  "destination_wallet_id": "destination-wallet-uuid",
+  "amount": 1500,
+  "currency": "USD",
+  "completed_at": "2026-11-24T00:00:00Z"
+}
+```
+
+The amount is an integer in the currency's smallest unit. Run the outbox integration coverage using the dedicated PostgreSQL test database setup above and `go test ./internal/service/wallet -run TransferOutboxIntegration`. The suite verifies event contents, replay behavior, failed transfers, independent events, and rollback when event insertion fails.

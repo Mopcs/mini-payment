@@ -365,6 +365,15 @@ func cleanupDepositData(t *testing.T, pool *pgxpool.Pool, userID uuid.UUID) {
 		t.Errorf("disable append-only trigger for isolated test cleanup: %v", err)
 		return
 	}
+	if _, err := tx.Exec(context.Background(), `DELETE FROM outbox_events
+		WHERE aggregate_id IN (
+			SELECT id FROM ledger_transactions
+			WHERE user_id = $1
+			   OR wallet_id IN (SELECT id FROM wallets WHERE user_id = $1)
+			   OR destination_wallet_id IN (SELECT id FROM wallets WHERE user_id = $1))`, userID); err != nil {
+		t.Errorf("delete test outbox events: %v", err)
+		return
+	}
 	if _, err := tx.Exec(context.Background(), `DELETE FROM ledger_entries WHERE transaction_id IN (
 		SELECT id FROM ledger_transactions
 		WHERE user_id = $1
@@ -413,7 +422,7 @@ func walletTestPool(t *testing.T) *pgxpool.Pool {
 		t.Fatalf("ping test database: %v", err)
 	}
 	var schemaReady bool
-	if err := pool.QueryRow(ctx, `SELECT to_regclass('public.users') IS NOT NULL AND to_regclass('public.wallets') IS NOT NULL AND to_regclass('public.ledger_accounts') IS NOT NULL AND to_regclass('public.ledger_transactions') IS NOT NULL AND to_regclass('public.ledger_entries') IS NOT NULL`).Scan(&schemaReady); err != nil || !schemaReady {
+	if err := pool.QueryRow(ctx, `SELECT to_regclass('public.users') IS NOT NULL AND to_regclass('public.wallets') IS NOT NULL AND to_regclass('public.ledger_accounts') IS NOT NULL AND to_regclass('public.ledger_transactions') IS NOT NULL AND to_regclass('public.ledger_entries') IS NOT NULL AND to_regclass('public.outbox_events') IS NOT NULL`).Scan(&schemaReady); err != nil || !schemaReady {
 		pool.Close()
 		if err != nil {
 			t.Fatalf("check test schema: %v", err)
