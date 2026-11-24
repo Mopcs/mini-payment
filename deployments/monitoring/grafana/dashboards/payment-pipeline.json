@@ -1,0 +1,427 @@
+{
+  "uid": "payment-pipeline",
+  "title": "Payment pipeline",
+  "description": "Transfer processing across three separate stages: API accept, outbox publish, consumer processing.",
+  "tags": ["mini-payment-system", "payments"],
+  "timezone": "browser",
+  "editable": true,
+  "graphTooltip": 1,
+  "refresh": "30s",
+  "schemaVersion": 39,
+  "version": 1,
+  "time": { "from": "now-3h", "to": "now" },
+  "templating": { "list": [] },
+  "panels": [
+    {
+      "id": 1,
+      "type": "row",
+      "title": "API stage — transfer accepted",
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 },
+      "panels": []
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "Transfer API accepted (HTTP 201)",
+      "description": "Requests to POST /api/v1/transfers answered with 201, meaning the ledger transaction committed. This is the API stage only: idempotent replays also return 201, so it counts accepted requests rather than distinct transfers.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 1 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "min": 0,
+          "custom": { "drawStyle": "line", "fillOpacity": 10, "showPoints": "never" }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum(rate(payment_http_requests_total{job=\"payment-api\",route=\"POST /api/v1/transfers\",status_code=\"201\"}[$__rate_interval]))",
+          "legendFormat": "accepted"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "Transfer API server errors (5xx)",
+      "description": "Requests to POST /api/v1/transfers answered with a 5xx status. A failure here means the transfer was rejected before any event reached the outbox.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 1 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "min": 0,
+          "custom": { "drawStyle": "line", "fillOpacity": 10, "showPoints": "never" },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red", "value": 0.001 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum(rate(payment_http_requests_total{job=\"payment-api\",route=\"POST /api/v1/transfers\",status_code=~\"5..\"}[$__rate_interval]))",
+          "legendFormat": "5xx"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "type": "row",
+      "title": "Outbox stage — event published",
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 9 },
+      "panels": []
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "Outbox events claimed",
+      "description": "Events locked by the worker per second. Claiming happens before publishing, so this is the offered load, not success.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 10 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "min": 0,
+          "custom": { "drawStyle": "line", "fillOpacity": 10, "showPoints": "never" }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum(rate(payment_outbox_events_claimed_total{job=\"payment-worker\"}[$__rate_interval]))",
+          "legendFormat": "claimed"
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "Outbox events published",
+      "description": "Events confirmed by RabbitMQ. Published means the broker acknowledged the message, not that the consumer has processed it.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 10 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "min": 0,
+          "custom": { "drawStyle": "line", "fillOpacity": 10, "showPoints": "never" }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum(rate(payment_outbox_events_published_total{job=\"payment-worker\"}[$__rate_interval]))",
+          "legendFormat": "published"
+        }
+      ]
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "Outbox publish failures",
+      "description": "Publish attempts that failed, including broker outages and unroutable messages. Each one schedules a retry.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 10 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "min": 0,
+          "custom": { "drawStyle": "line", "fillOpacity": 10, "showPoints": "never" },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red", "value": 0.001 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum(rate(payment_outbox_publish_failures_total{job=\"payment-worker\"}[$__rate_interval]))",
+          "legendFormat": "failures"
+        }
+      ]
+    },
+    {
+      "id": 8,
+      "type": "timeseries",
+      "title": "Outbox retry attempts",
+      "description": "Retries successfully scheduled after a publish failure. Compare with publish failures: a gap means the retry could not be written either.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 18 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "min": 0,
+          "custom": { "drawStyle": "line", "fillOpacity": 10, "showPoints": "never" }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum(rate(payment_outbox_retry_attempts_total{job=\"payment-worker\"}[$__rate_interval]))",
+          "legendFormat": "retries"
+        }
+      ]
+    },
+    {
+      "id": 9,
+      "type": "stat",
+      "title": "Oldest pending outbox event age",
+      "description": "Age of the oldest unpublished event. This is the best single indicator that the pipeline is stalled: it grows even when no new transfers arrive.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 18 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "min": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "orange", "value": 60 },
+              { "color": "red", "value": 300 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "max(payment_outbox_oldest_pending_age_seconds{job=\"payment-worker\"})",
+          "legendFormat": "oldest"
+        }
+      ]
+    },
+    {
+      "id": 10,
+      "type": "stat",
+      "title": "Outbox jobs running",
+      "description": "Events currently being published by the worker. Sustained values above the batch size suggest publishes are not completing.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 18 },
+      "fieldConfig": {
+        "defaults": { "unit": "short", "min": 0, "decimals": 0 },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum(payment_outbox_jobs_running{job=\"payment-worker\"})",
+          "legendFormat": "running"
+        }
+      ]
+    },
+    {
+      "id": 11,
+      "type": "row",
+      "title": "Consumer stage — notification recorded",
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 26 },
+      "panels": []
+    },
+    {
+      "id": 12,
+      "type": "timeseries",
+      "title": "Consumer messages received",
+      "description": "Deliveries handed to the consumer by RabbitMQ, before any processing attempt.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 27 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "min": 0,
+          "custom": { "drawStyle": "line", "fillOpacity": 10, "showPoints": "never" }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum(rate(payment_consumer_messages_received_total{job=\"payment-consumer\"}[$__rate_interval]))",
+          "legendFormat": "received"
+        }
+      ]
+    },
+    {
+      "id": 13,
+      "type": "timeseries",
+      "title": "Consumer messages processed",
+      "description": "Messages whose notification transaction committed. This is the end of the pipeline, not a duplicate of the API or outbox panels.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 27 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "min": 0,
+          "custom": { "drawStyle": "line", "fillOpacity": 10, "showPoints": "never" }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum(rate(payment_consumer_messages_processed_total{job=\"payment-consumer\"}[$__rate_interval]))",
+          "legendFormat": "processed"
+        }
+      ]
+    },
+    {
+      "id": 14,
+      "type": "timeseries",
+      "title": "Consumer duplicate events",
+      "description": "Redelivered events already recorded earlier. A steady trickle is normal after a consumer restart; a sustained rate points at ack or lease problems.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 27 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "min": 0,
+          "custom": { "drawStyle": "line", "fillOpacity": 10, "showPoints": "never" }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum(rate(payment_consumer_duplicate_events_total{job=\"payment-consumer\"}[$__rate_interval]))",
+          "legendFormat": "duplicates"
+        }
+      ]
+    },
+    {
+      "id": 15,
+      "type": "timeseries",
+      "title": "Consumer processing failures",
+      "description": "Processing attempts that returned an error. Includes transient database errors that will be retried, so pair it with the dead-letter panel.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 35 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "min": 0,
+          "custom": { "drawStyle": "line", "fillOpacity": 10, "showPoints": "never" },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "orange", "value": 0.001 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum(rate(payment_consumer_processing_failures_total{job=\"payment-consumer\"}[$__rate_interval]))",
+          "legendFormat": "failures"
+        }
+      ]
+    },
+    {
+      "id": 16,
+      "type": "timeseries",
+      "title": "Dead-lettered messages",
+      "description": "Messages forwarded to the dead-letter queue: permanent errors and exhausted retries. This is the count of events that will never be processed automatically.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 35 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "min": 0,
+          "custom": { "drawStyle": "line", "fillOpacity": 10, "showPoints": "never" },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red", "value": 0.001 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum(rate(payment_consumer_messages_dead_lettered_total{job=\"payment-consumer\"}[$__rate_interval]))",
+          "legendFormat": "dead-lettered"
+        }
+      ]
+    },
+    {
+      "id": 17,
+      "type": "timeseries",
+      "title": "Consumer processing duration p95",
+      "description": "95th percentile of message processing time, computed from payment_consumer_processing_duration_seconds_bucket.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 35 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "min": 0,
+          "custom": { "drawStyle": "line", "fillOpacity": 10, "showPoints": "never" }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(payment_consumer_processing_duration_seconds_bucket{job=\"payment-consumer\"}[$__rate_interval])))",
+          "legendFormat": "p95"
+        }
+      ]
+    },
+    {
+      "id": 18,
+      "type": "row",
+      "title": "How to read this dashboard",
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 43 },
+      "panels": []
+    },
+    {
+      "id": 19,
+      "type": "text",
+      "title": "Stage semantics and missing metrics",
+      "description": "Explains why the three stages are not the same number.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 9, "w": 24, "x": 0, "y": 44 },
+      "options": {
+        "mode": "markdown",
+        "content": "**The three stages are different events. Do not add them together or read one as proof of another.**\n\n| Stage | Metric | What it proves |\n| --- | --- | --- |\n| API | `payment_http_requests_total{route=\"POST /api/v1/transfers\",status_code=\"201\"}` | The ledger transaction committed. The client got an answer. |\n| Outbox | `payment_outbox_events_published_total` | RabbitMQ confirmed the `transfer.completed` message. |\n| Consumer | `payment_consumer_messages_processed_total` | The notification was recorded for the event. |\n\nA transfer can be accepted by the API and still sit in the outbox, and an event can be published and still fail in the consumer. Watch the gap between the stages, not a single total.\n\n**Not charted because the metric does not exist:**\n\n- There is no dedicated `transfers_completed` counter. The API panel is HTTP-level and also counts idempotent replays that returned 201, so it is not a count of distinct transfers.\n- Dead-letter queue *depth* is not exported. Only the dead-letter rate is available, so backlog size must be read from RabbitMQ directly.\n- PostgreSQL pool maximum is not exported by the collector, so pool headroom cannot be charted.\n- Balances are never derived from Prometheus. Ledger state belongs to PostgreSQL."
+      }
+    }
+  ]
+}
