@@ -1,0 +1,1 @@
+# Grafana reads this directory for alerting provisioning; kept so the mount does not hide it.
