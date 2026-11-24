@@ -28,6 +28,16 @@ type transferServiceStub struct {
 	amount         int64
 	currency       string
 	idempotencyKey string
+	items          []domain.TransferHistoryItem
+	total          int64
+	listUserID     uuid.UUID
+	filter         domain.TransferHistoryFilter
+	listErr        error
+}
+
+func (s *transferServiceStub) List(_ context.Context, userID uuid.UUID, filter domain.TransferHistoryFilter) ([]domain.TransferHistoryItem, int64, error) {
+	s.listUserID, s.filter = userID, filter
+	return s.items, s.total, s.listErr
 }
 
 func (s *transferServiceStub) Transfer(_ context.Context, userID, sourceID, destinationID uuid.UUID, amount int64, currency, key string) (domain.Transfer, bool, error) {
@@ -100,6 +110,76 @@ func TestTransferHandlerRequiresAuthentication(t *testing.T) {
 	response := sendTransferRequest(service, tokenValidatorStub{err: errors.New("invalid token")}, `{}`, "bad", "key")
 	if response.Code != http.StatusUnauthorized {
 		t.Fatalf("status=%d, want 401", response.Code)
+	}
+}
+
+func TestParseTransferHistoryFilter(t *testing.T) {
+	for _, test := range []struct {
+		query string
+		want  domain.TransferHistoryFilter
+		valid bool
+	}{
+		{query: "", want: domain.TransferHistoryFilter{Limit: 20}, valid: true},
+		{query: "limit=100&offset=0&direction=INCOMING&currency=usd", want: domain.TransferHistoryFilter{Limit: 100, Direction: "incoming", Currency: "USD"}, valid: true},
+		{query: "limit=0", valid: false}, {query: "limit=101", valid: false},
+		{query: "limit=", valid: false}, {query: "offset=", valid: false},
+		{query: "limit=no", valid: false}, {query: "offset=-1", valid: false},
+		{query: "offset=1000001", valid: false}, {query: "direction=sideways", valid: false},
+		{query: "direction=", valid: false}, {query: "currency=CAD", valid: false},
+		{query: "currency=", valid: false}, {query: "limit=10&limit=20", valid: false},
+		{query: "user_id=" + uuid.NewString(), valid: false}, {query: "sort=amount", valid: false},
+	} {
+		t.Run(test.query, func(t *testing.T) {
+			r := httptest.NewRequest(http.MethodGet, "/api/v1/transfers?"+test.query, nil)
+			got, err := parseTransferHistoryFilter(r)
+			if (err == nil) != test.valid {
+				t.Fatalf("parse error = %v, valid=%v", err, test.valid)
+			}
+			if test.valid && got != test.want {
+				t.Fatalf("filter = %+v, want %+v", got, test.want)
+			}
+		})
+	}
+}
+
+func TestTransferHistoryHandlerUsesAuthenticatedUser(t *testing.T) {
+	userID := uuid.New()
+	service := &transferServiceStub{items: []domain.TransferHistoryItem{}, total: 4}
+	mux := http.NewServeMux()
+	NewTransfers(service, slog.New(slog.NewTextHandler(io.Discard, nil))).Register(mux, tokenValidatorStub{userID: userID})
+	request := httptest.NewRequest(http.MethodGet, "/api/v1/transfers?direction=outgoing&currency=usd", nil)
+	request.Header.Set("Authorization", "Bearer valid")
+	response := httptest.NewRecorder()
+	mux.ServeHTTP(response, request)
+	if response.Code != http.StatusOK || service.listUserID != userID || service.filter.Direction != "outgoing" || service.filter.Currency != "USD" {
+		t.Fatalf("status=%d user=%s filter=%+v body=%s", response.Code, service.listUserID, service.filter, response.Body.String())
+	}
+	if !strings.Contains(response.Body.String(), `"items":[]`) || !strings.Contains(response.Body.String(), `"total":4`) {
+		t.Fatalf("unexpected response: %s", response.Body.String())
+	}
+}
+
+func TestTransferHistoryHandlerRejectsUnauthenticatedAndInvalidQuery(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		token middleware.TokenValidator
+		path  string
+		want  int
+	}{
+		{name: "unauthorized", token: tokenValidatorStub{err: errors.New("invalid token")}, path: "/api/v1/transfers", want: http.StatusUnauthorized},
+		{name: "invalid query", token: tokenValidatorStub{userID: uuid.New()}, path: "/api/v1/transfers?limit=101", want: http.StatusBadRequest},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			mux := http.NewServeMux()
+			NewTransfers(&transferServiceStub{}, slog.New(slog.NewTextHandler(io.Discard, nil))).Register(mux, test.token)
+			request := httptest.NewRequest(http.MethodGet, test.path, nil)
+			request.Header.Set("Authorization", "Bearer valid")
+			response := httptest.NewRecorder()
+			mux.ServeHTTP(response, request)
+			if response.Code != test.want {
+				t.Fatalf("status=%d want=%d", response.Code, test.want)
+			}
+		})
 	}
 }
 

@@ -80,6 +80,34 @@ Each wallet has a ledger account, created by the database when the wallet is ins
 
 `POST /api/v1/transfers` moves a positive integer amount between two wallets of the same currency. The authenticated user must own the source wallet; the destination can belong to another user. Transfers use the same per-user `Idempotency-Key` table as deposits, and reject a key reused for a different operation or payload. Both wallet rows are locked in UUID order, then the balances and two wallet ledger entries are committed together. Transfers do not use a system funding account. Migration 4's down migration refuses to remove transfer support while transfer records exist.
 
+`GET /api/v1/transfers` requires a bearer access token and returns completed transfers where the authenticated user's wallets are the source or destination. The `limit` parameter defaults to 20 and accepts 1–100; `offset` defaults to 0 and accepts 0–1,000,000. Optional `direction` accepts `incoming` or `outgoing`, and `currency` accepts `USD`, `EUR`, or `JPY` (case-insensitive). Invalid parameters return `400`. Results are ordered by creation time descending, then transfer ID descending. `total` is the count matching the same ownership and filter rules, before pagination; amounts are integer minor units.
+
+```http
+GET /api/v1/transfers?limit=20&offset=0&direction=incoming&currency=USD
+Authorization: Bearer <access-token>
+```
+
+```json
+{
+  "items": [
+    {
+      "id": "6b8e9570-06c8-49d4-9bcb-8e902c68e781",
+      "source_wallet_id": "a91f9b48-4934-42fb-a286-35b739178c8d",
+      "destination_wallet_id": "d1bff4d0-0cd9-4234-9e8d-b1a7d318408f",
+      "amount": 1500,
+      "currency": "USD",
+      "status": "completed",
+      "created_at": "2026-11-24T00:00:00Z"
+    }
+  ],
+  "limit": 20,
+  "offset": 0,
+  "total": 42
+}
+```
+
+An empty result uses `"items": []`. The existing source history index (`ledger_transactions_wallet_created_idx`) and destination history index (`ledger_transactions_destination_wallet_idx`) support the two wallet relationships and ordering; no additional index is needed.
+
 ## Integration tests
 
 PostgreSQL integration tests use `TEST_DATABASE_URL` and require a dedicated database whose name ends in `_test`; the test helper rejects other database names. Create that database separately and apply all migrations to it before running the tests. Never point `TEST_DATABASE_URL` or the migration command at the development database for test runs.
