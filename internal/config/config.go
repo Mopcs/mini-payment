@@ -13,27 +13,36 @@ import (
 )
 
 type Config struct {
-	AppAddr             string
-	PostgresHost        string
-	PostgresPort        uint16
-	PostgresDB          string
-	PostgresUser        string
-	PostgresPass        string
-	RedisHost           string
-	RedisPort           uint16
-	RedisPassword       string
-	LogLevel            string
-	JWTSecret           string
-	JWTIssuer           string
-	JWTAccessTokenTTL   time.Duration
-	RabbitMQURL         string
-	RabbitMQExchange    string
-	RabbitMQQueue       string
-	RabbitMQRoutingKey  string
-	OutboxBatchSize     int
-	OutboxPollInterval  time.Duration
-	OutboxLeaseDuration time.Duration
-	OutboxMaxBackoff    time.Duration
+	AppAddr                      string
+	PostgresHost                 string
+	PostgresPort                 uint16
+	PostgresDB                   string
+	PostgresUser                 string
+	PostgresPass                 string
+	RedisHost                    string
+	RedisPort                    uint16
+	RedisPassword                string
+	LogLevel                     string
+	JWTSecret                    string
+	JWTIssuer                    string
+	JWTAccessTokenTTL            time.Duration
+	RabbitMQURL                  string
+	RabbitMQExchange             string
+	RabbitMQQueue                string
+	RabbitMQRoutingKey           string
+	RabbitMQRetryExchange        string
+	RabbitMQRetryQueue           string
+	RabbitMQDeadLetterExchange   string
+	RabbitMQDeadLetterQueue      string
+	RabbitMQDeadLetterRoutingKey string
+	RabbitMQRetryDelay           time.Duration
+	OutboxBatchSize              int
+	OutboxPollInterval           time.Duration
+	OutboxLeaseDuration          time.Duration
+	OutboxMaxBackoff             time.Duration
+	ConsumerMaxRetries           int
+	ConsumerPrefetchCount        int
+	ConsumerReconnectInterval    time.Duration
 }
 
 // Load reads .env when it exists, then the environment, and validates every
@@ -106,29 +115,65 @@ func Load() (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	retryDelay, err := durationFromEnv("RABBITMQ_RETRY_DELAY", 5*time.Second)
+	if err != nil || retryDelay < time.Millisecond || retryDelay.Milliseconds() > int64(^uint32(0)>>1) {
+		return Config{}, errors.New("RABBITMQ_RETRY_DELAY must be between 1ms and the supported queue TTL limit")
+	}
+	consumerMaxRetries, err := intFromEnv("CONSUMER_MAX_RETRIES", 5, 0, 100)
+	if err != nil {
+		return Config{}, err
+	}
+	consumerPrefetch, err := intFromEnv("CONSUMER_PREFETCH_COUNT", 10, 1, 1000)
+	if err != nil {
+		return Config{}, err
+	}
+	consumerReconnect, err := durationFromEnv("CONSUMER_RECONNECT_INTERVAL", time.Second)
+	if err != nil {
+		return Config{}, err
+	}
+	rabbitExchange := strings.TrimSpace(envOrDefault("RABBITMQ_EXCHANGE", "payment.events"))
+	rabbitQueue := strings.TrimSpace(envOrDefault("RABBITMQ_QUEUE", "payment.events"))
+	rabbitRoutingKey := strings.TrimSpace(envOrDefault("RABBITMQ_ROUTING_KEY", "transfer.completed"))
+	retryExchange := strings.TrimSpace(envOrDefault("RABBITMQ_RETRY_EXCHANGE", "payment.events.retry"))
+	retryQueue := strings.TrimSpace(envOrDefault("RABBITMQ_RETRY_QUEUE", "payment.events.retry"))
+	deadLetterExchange := strings.TrimSpace(envOrDefault("RABBITMQ_DEAD_LETTER_EXCHANGE", "payment.events.dlx"))
+	deadLetterQueue := strings.TrimSpace(envOrDefault("RABBITMQ_DEAD_LETTER_QUEUE", "payment.events.dlq"))
+	deadLetterRoutingKey := strings.TrimSpace(envOrDefault("RABBITMQ_DEAD_LETTER_ROUTING_KEY", "transfer.completed.dlq"))
+	if rabbitExchange == "" || rabbitQueue == "" || rabbitRoutingKey == "" || retryExchange == "" || retryQueue == "" || deadLetterExchange == "" || deadLetterQueue == "" || deadLetterRoutingKey == "" {
+		return Config{}, errors.New("RabbitMQ exchange, queue, and routing key settings must not be empty")
+	}
 
 	return Config{
-		AppAddr:             envOrDefault("APP_ADDR", ":8080"),
-		PostgresHost:        envOrDefault("POSTGRES_HOST", "localhost"),
-		PostgresPort:        postgresPort,
-		PostgresDB:          envOrDefault("POSTGRES_DB", "payment_db"),
-		PostgresUser:        envOrDefault("POSTGRES_USER", "payment_user"),
-		PostgresPass:        postgresPassword,
-		RedisHost:           envOrDefault("REDIS_HOST", "localhost"),
-		RedisPort:           redisPort,
-		RedisPassword:       redisPassword,
-		LogLevel:            logLevel,
-		JWTSecret:           jwtSecret,
-		JWTIssuer:           jwtIssuer,
-		JWTAccessTokenTTL:   jwtTTL,
-		RabbitMQURL:         rabbitURL,
-		RabbitMQExchange:    strings.TrimSpace(envOrDefault("RABBITMQ_EXCHANGE", "payment.events")),
-		RabbitMQQueue:       strings.TrimSpace(envOrDefault("RABBITMQ_QUEUE", "payment.events")),
-		RabbitMQRoutingKey:  strings.TrimSpace(envOrDefault("RABBITMQ_ROUTING_KEY", "transfer.completed")),
-		OutboxBatchSize:     batchSize,
-		OutboxPollInterval:  pollInterval,
-		OutboxLeaseDuration: leaseDuration,
-		OutboxMaxBackoff:    maxBackoff,
+		AppAddr:                      envOrDefault("APP_ADDR", ":8080"),
+		PostgresHost:                 envOrDefault("POSTGRES_HOST", "localhost"),
+		PostgresPort:                 postgresPort,
+		PostgresDB:                   envOrDefault("POSTGRES_DB", "payment_db"),
+		PostgresUser:                 envOrDefault("POSTGRES_USER", "payment_user"),
+		PostgresPass:                 postgresPassword,
+		RedisHost:                    envOrDefault("REDIS_HOST", "localhost"),
+		RedisPort:                    redisPort,
+		RedisPassword:                redisPassword,
+		LogLevel:                     logLevel,
+		JWTSecret:                    jwtSecret,
+		JWTIssuer:                    jwtIssuer,
+		JWTAccessTokenTTL:            jwtTTL,
+		RabbitMQURL:                  rabbitURL,
+		RabbitMQExchange:             rabbitExchange,
+		RabbitMQQueue:                rabbitQueue,
+		RabbitMQRoutingKey:           rabbitRoutingKey,
+		RabbitMQRetryExchange:        retryExchange,
+		RabbitMQRetryQueue:           retryQueue,
+		RabbitMQDeadLetterExchange:   deadLetterExchange,
+		RabbitMQDeadLetterQueue:      deadLetterQueue,
+		RabbitMQDeadLetterRoutingKey: deadLetterRoutingKey,
+		RabbitMQRetryDelay:           retryDelay,
+		OutboxBatchSize:              batchSize,
+		OutboxPollInterval:           pollInterval,
+		OutboxLeaseDuration:          leaseDuration,
+		OutboxMaxBackoff:             maxBackoff,
+		ConsumerMaxRetries:           consumerMaxRetries,
+		ConsumerPrefetchCount:        consumerPrefetch,
+		ConsumerReconnectInterval:    consumerReconnect,
 	}, nil
 }
 

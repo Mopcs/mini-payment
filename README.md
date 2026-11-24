@@ -1,4 +1,4 @@
- az# Mini Payment Processing System
+ Mini Payment Processing System
 
 A Go modular monolith for processing payments between users. PostgreSQL is the source of truth for financial data; Redis is reserved for supporting features such as caching and rate limiting.
 
@@ -178,7 +178,45 @@ The API never connects to RabbitMQ. If the broker is unavailable, transfers cont
 
 The worker claims due unpublished events in short PostgreSQL transactions with `FOR UPDATE SKIP LOCKED`, then commits those leases before publishing. Active leases prevent normal concurrent claims; an expired lease makes an event available after a worker crash. On publication failure, the worker clears the lease, increments `attempts`, records `last_error`, and schedules exponential backoff starting at one second, capped by `OUTBOX_MAX_BACKOFF`. Confirmed events are marked published and retained in PostgreSQL. RabbitMQ confirmations are awaited, and mandatory publishes that are returned as unroutable are retried.
 
-Delivery is **at least once**, not exactly once. If RabbitMQ confirms a message but PostgreSQL fails to mark it published, the lease eventually expires and the same stable event ID may be published again. Consumers must deduplicate using the AMQP message ID. This iteration includes no consumer, dead-letter queue, or metrics.
+Delivery is **at least once**, not exactly once. If RabbitMQ confirms a message but PostgreSQL fails to mark it published, the lease eventually expires and the same stable event ID may be published again. Consumers deduplicate using the AMQP message ID.
+
+## Transfer event consumer
+
+Run the consumer separately from the API and outbox publisher:
+
+```powershell
+go run ./cmd/consumer
+```
+
+Migration 7 adds `processed_events` for event ID deduplication and `notifications` for persisted user notifications. For each `transfer.completed` event, the consumer verifies the immutable event against the outbox and completed ledger transfer, then records outgoing and incoming notifications for the users who own the two wallets. These changes happen in one PostgreSQL transaction. Duplicate event IDs commit without adding notifications. The consumer does not change balances or ledger entries and does not call an external notification service.
+
+The durable topology uses `payment.events` for the main queue, `payment.events.retry` with a broker-managed TTL delay, and `payment.events.dlx` / `payment.events.dlq` for invalid messages and exhausted retries. `CONSUMER_MAX_RETRIES` counts retries after the initial delivery. Retry count is carried in `x-retry-count`; the broker's redelivery flag is not used as an attempt counter. Each retry or dead-letter copy is published persistently with publisher confirmation before the original is acknowledged. A database commit happens before successful acknowledgement. Together with event-ID deduplication, this provides at-least-once delivery without duplicate notification side effects.
+
+The main and dead-letter queues retain messages durably. Inspect stored notices with:
+
+```sql
+SELECT user_id, notification_type, payload, created_at
+FROM notifications
+ORDER BY created_at DESC, id DESC;
+```
+
+Configure `RABBITMQ_RETRY_*`, `RABBITMQ_DEAD_LETTER_*`, `RABBITMQ_RETRY_DELAY`, `CONSUMER_MAX_RETRIES`, `CONSUMER_PREFETCH_COUNT`, and `CONSUMER_RECONNECT_INTERVAL` in `.env`. The consumer shares the main queue declared by the publisher; both processes must use the same exchange, queue, and routing key.
+
+Consumer database integration tests require a dedicated migrated database whose name ends in `_test`, configured with `CONSUMER_TEST_DATABASE_URL`. Keep it separate from `TEST_DATABASE_URL` and `OUTBOX_TEST_DATABASE_URL`. Run the database integration coverage with:
+
+```powershell
+$env:CONSUMER_TEST_DATABASE_URL = 'postgres://payment_user:test-only-password@127.0.0.1:5433/payment_consumer_test?sslmode=disable'
+go test ./internal/consumer/transfer -run TestConsumerDatabaseIntegration -count=1
+```
+
+The consumer package's unit tests, including retry routing and acknowledgement ordering, run with `go test ./internal/consumer/transfer -count=1`. Set `TEST_RABBITMQ_URL` to a dedicated broker for any RabbitMQ integration checks; never point it at the development broker.
+
+The RabbitMQ test uses unique exchanges and queues on that broker and verifies a delayed retry and dead-letter routing:
+
+```powershell
+$env:TEST_RABBITMQ_URL = 'amqp://test-user:test-password@127.0.0.1:5673/'
+go test ./internal/consumer/transfer -run TestRabbitMQDeliveryIntegration -count=1
+```
 
 Worker repository tests use a separate database named with the `_test` suffix via `OUTBOX_TEST_DATABASE_URL`; keep it separate from `TEST_DATABASE_URL` because Go runs package tests concurrently. Create it and apply all migrations before testing. RabbitMQ integration tests are opt-in and require a separate test broker; set `TEST_RABBITMQ_URL` to its AMQP URL, never to the development broker. Then run:
 
