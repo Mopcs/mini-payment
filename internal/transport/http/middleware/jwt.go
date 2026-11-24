@@ -42,5 +42,7 @@ func writeUnauthorized(w http.ResponseWriter) {
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(http.StatusUnauthorized)
-	_, _ = w.Write([]byte(`{"error":{"code":"unauthorized","message":"authentication required"}}` + "\n"))
+	_, _ = w.Write([]byte(
+		`{"error":{"code":"unauthorized","message":"authentication required"}}` + "\n",
+	))
 }
