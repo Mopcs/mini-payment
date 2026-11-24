@@ -104,8 +104,9 @@ func (w *Worker) processBatch(ctx context.Context, publisher Publisher) bool {
 		return false
 	}
 	w.logger.Info("claimed outbox events", slog.Int("count", len(events)), slog.String("worker_id", w.workerID.String()))
-	connectionFailed := false
+	connectionFailed := false // a publish error usually means the channel is gone
 	for _, event := range events {
+		// Top up the lease first, publishing can outlast what is left of it.
 		if err := w.repository.ExtendLease(ctx, event.ID, w.workerID, w.settings.LeaseDuration); err != nil {
 			w.logger.Warn("outbox event lease is no longer owned", slog.String("event_id", event.ID.String()))
 			continue
@@ -137,6 +138,7 @@ func (w *Worker) processBatch(ctx context.Context, publisher Publisher) bool {
 	return connectionFailed
 }
 
+// RetryDelay doubles the wait starting at one second, capped at maximum.
 func RetryDelay(attempt int, maximum time.Duration) time.Duration {
 	if maximum <= 0 {
 		return 0

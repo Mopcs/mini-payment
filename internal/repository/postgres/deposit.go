@@ -61,6 +61,8 @@ func (r *DepositRepository) Create(ctx context.Context, userID, walletID uuid.UU
 		return existing, true, nil
 	}
 
+	// Hold the wallet row until commit, otherwise two deposits can read the same
+	// balance and the second one silently overwrites the first.
 	var walletCurrency string
 	var balance int64
 	err = tx.QueryRow(ctx, `
@@ -78,7 +80,7 @@ func (r *DepositRepository) Create(ctx context.Context, userID, walletID uuid.UU
 	if walletCurrency != currency {
 		return domain.Deposit{}, false, ErrDepositCurrencyMismatch
 	}
-	if amount > math.MaxInt64-balance {
+	if amount > math.MaxInt64-balance { // would wrap into a negative balance
 		return domain.Deposit{}, false, ErrBalanceOverflow
 	}
 
@@ -123,6 +125,8 @@ func (r *DepositRepository) Create(ctx context.Context, userID, walletID uuid.UU
 		return domain.Deposit{}, false, translateError("write deposit ledger entries", err)
 	}
 
+	// The schema trigger checks this as well, but catching it here keeps the
+	// error readable and the transaction short.
 	var balanced bool
 	if err := tx.QueryRow(ctx, `
 		SELECT count(*) >= 2 AND COALESCE(sum(le.amount), 0) = 0

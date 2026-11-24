@@ -48,6 +48,7 @@ func VerifyPassword(password, encodedHash string) (bool, error) {
 		return false, err
 	}
 	actual := argon2.IDKey([]byte(password), salt, params.time, params.memory, params.threads, uint32(len(expected)))
+	// Constant time, so the response doesn't leak how much of the hash matched.
 	return subtle.ConstantTimeCompare(actual, expected) == 1, nil
 }
 
@@ -99,6 +100,8 @@ func parseArgonParameters(encoded string) (argonParameters, error) {
 		}
 		values[key] = parsed
 	}
+	// Bounds stop a corrupted or hostile stored hash from asking for gigabytes of
+	// memory the next time somebody logs in.
 	if len(values) != 3 || values["m"] < 8*1024 || values["m"] > 256*1024 || values["t"] < 1 || values["t"] > 10 || values["p"] < 1 || values["p"] > 8 {
 		return argonParameters{}, errorsInvalidPasswordHash()
 	}

@@ -66,6 +66,8 @@ func (h *Transfers) Register(mux *http.ServeMux, tokens middleware.TokenValidato
 func parseTransferHistoryFilter(r *http.Request) (domain.TransferHistoryFilter, error) {
 	filter := domain.TransferHistoryFilter{Limit: 20}
 	query := r.URL.Query()
+	// Unknown parameters are rejected instead of ignored, otherwise a typo in a
+	// filter silently returns unfiltered results.
 	for key := range query {
 		switch key {
 		case "limit", "offset", "direction", "currency":
@@ -168,7 +170,7 @@ func (h *Transfers) create(w http.ResponseWriter, r *http.Request) {
 		h.logger.Error("transfer failed", slog.Any("error", err))
 		writeError(w, http.StatusInternalServerError, "internal_error", "request could not be completed")
 	default:
-		if replay {
+		if replay { // same key and body as an earlier request
 			w.Header().Set("Idempotent-Replay", "true")
 		}
 		w.Header().Set("Cache-Control", "no-store")

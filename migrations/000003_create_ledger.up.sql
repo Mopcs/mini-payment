@@ -87,6 +87,7 @@ CREATE TABLE ledger_entries (
 CREATE INDEX ledger_entries_transaction_idx ON ledger_entries (transaction_id);
 CREATE INDEX ledger_entries_account_created_idx ON ledger_entries (account_id, created_at, id);
 
+-- Entries are append-only. A correction is a new transaction, never an edit.
 CREATE FUNCTION reject_ledger_entry_mutation() RETURNS trigger AS $$
 BEGIN
     RAISE EXCEPTION 'ledger entries are append-only' USING ERRCODE = '55000';
@@ -150,6 +151,8 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
+-- Deferred, because the transaction row and both entries have to exist before
+-- the balance can be checked.
 CREATE CONSTRAINT TRIGGER ledger_transactions_balanced
     AFTER INSERT ON ledger_transactions
     DEFERRABLE INITIALLY DEFERRED

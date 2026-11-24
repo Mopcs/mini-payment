@@ -212,6 +212,7 @@ func decodeJSONRequest(w http.ResponseWriter, r *http.Request, target any, reque
 		}
 		return &requestDecodeError{status: http.StatusBadRequest, code: "invalid_request", text: "request body must contain valid " + requestName + " JSON"}
 	}
+	// Second decode has to hit EOF. Anything else means trailing garbage.
 	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
 		return &requestDecodeError{status: http.StatusBadRequest, code: "invalid_request", text: "request body must contain exactly one JSON value"}
 	}

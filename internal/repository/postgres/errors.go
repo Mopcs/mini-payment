@@ -44,6 +44,8 @@ func (e *databaseOperationError) Unwrap() error {
 	return e.cause
 }
 
+// translateError turns driver errors into the sentinels above, so callers can
+// use errors.Is and never have to match PostgreSQL error codes themselves.
 func translateError(operation string, err error) error {
 	if err == nil {
 		return nil

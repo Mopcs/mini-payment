@@ -36,6 +36,8 @@ type Config struct {
 	OutboxMaxBackoff    time.Duration
 }
 
+// Load reads .env when it exists, then the environment, and validates every
+// value here so the rest of the program can use Config without rechecking it.
 func Load() (Config, error) {
 	if err := godotenv.Load(".env"); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return Config{}, errors.New("load .env: file could not be parsed")

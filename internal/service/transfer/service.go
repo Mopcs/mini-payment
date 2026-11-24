@@ -60,6 +60,8 @@ func (s *Service) Transfer(ctx context.Context, userID, sourceWalletID, destinat
 		return domain.Transfer{}, false, ErrInvalidIdempotencyKey
 	}
 
+	// Same hashing scheme as deposits, except the type tag goes into the input.
+	// That way a key used for a deposit can never be replayed as a transfer.
 	requestHash := transferRequestHash(userID, sourceWalletID, destinationWalletID, amount, currency)
 	result, replay, err := s.repository.Create(ctx, userID, sourceWalletID, destinationWalletID, amount, currency, idempotencyKey, requestHash[:])
 	switch {

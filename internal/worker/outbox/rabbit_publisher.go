@@ -65,6 +65,7 @@ func NewRabbitPublisher(ctx context.Context, settings RabbitSettings) (*RabbitPu
 		_ = connection.Close()
 		return nil, fmt.Errorf("bind RabbitMQ queue: %w", err)
 	}
+	// Publisher confirms make Publish block until the broker has the message.
 	if err := channel.Confirm(false); err != nil {
 		_ = channel.Close()
 		_ = connection.Close()
@@ -76,6 +77,7 @@ func NewRabbitPublisher(ctx context.Context, settings RabbitSettings) (*RabbitPu
 }
 
 func (p *RabbitPublisher) Publish(ctx context.Context, event domain.OutboxEvent) error {
+	// amqp channels are not safe for concurrent use, so serialise publishes.
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if p.connection == nil || p.channel == nil || p.connection.IsClosed() {
@@ -85,6 +87,8 @@ func (p *RabbitPublisher) Publish(ctx context.Context, event domain.OutboxEvent)
 	if err != nil {
 		return fmt.Errorf("marshal event payload: %w", err)
 	}
+	// mandatory=true asks the broker to return the message instead of dropping it
+	// when nothing is bound to the routing key.
 	if err := p.channel.PublishWithContext(ctx, p.settings.Exchange, p.settings.RoutingKey, true, false, amqp091.Publishing{
 		ContentType:  "application/json",
 		DeliveryMode: amqp091.Persistent,

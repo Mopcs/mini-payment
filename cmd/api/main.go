@@ -87,6 +87,7 @@ func run(cfg config.Config, logger *slog.Logger) error {
 		return nil
 	}
 
+	// Give in-flight requests a moment to finish, but don't hang forever.
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	if err := server.Shutdown(shutdownCtx); err != nil {

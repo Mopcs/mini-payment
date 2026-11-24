@@ -26,6 +26,7 @@ func NewTransferRepository(pool *pgxpool.Pool) *TransferRepository {
 }
 
 func (r *TransferRepository) List(ctx context.Context, userID uuid.UUID, filter domain.TransferHistoryFilter) ([]domain.TransferHistoryItem, int64, error) {
+	// One snapshot for both the count and the page, so total always matches items.
 	tx, err := r.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
 	if err != nil {
 		return nil, 0, fmt.Errorf("begin transfer history transaction: %w", err)
@@ -146,11 +147,13 @@ func (r *TransferRepository) Create(ctx context.Context, userID, sourceID, desti
 		return existing, true, nil
 	}
 
-	// Lock wallets in UUID order so opposite-direction transfers use the same order.
+	// Lock both wallets in UUID order so A->B and B->A can't deadlock each other.
 	lockOrder := []uuid.UUID{sourceID, destinationID}
 	if bytes.Compare(lockOrder[0][:], lockOrder[1][:]) > 0 {
 		lockOrder[0], lockOrder[1] = lockOrder[1], lockOrder[0]
 	}
+	// Missing rows are skipped and reported after the loop, so the caller can't
+	// tell a nonexistent wallet from one that belongs to somebody else.
 	locked := make(map[uuid.UUID]lockedTransferWallet, 2)
 	for _, walletID := range lockOrder {
 		var wallet lockedTransferWallet
@@ -173,6 +176,7 @@ func (r *TransferRepository) Create(ctx context.Context, userID, sourceID, desti
 	if !sourceExists || !destinationExists {
 		return domain.Transfer{}, false, ErrTransferWalletNotFound
 	}
+	// Someone else's wallet is treated exactly like a missing one.
 	if source.userID != userID {
 		return domain.Transfer{}, false, ErrTransferSourceNotOwned
 	}
@@ -216,6 +220,7 @@ func (r *TransferRepository) Create(ctx context.Context, userID, sourceID, desti
 		return domain.Transfer{}, false, translateError("write transfer ledger entries", err)
 	}
 
+	// Cheap sanity check before commit: two entries, net zero, one currency.
 	var balanced bool
 	if err := tx.QueryRow(ctx, `
 		SELECT count(*) = 2 AND COALESCE(sum(le.amount), 0) = 0
@@ -284,6 +289,8 @@ func transferWalletAccount(ctx context.Context, tx pgx.Tx, walletID uuid.UUID, c
 	return accountID, nil
 }
 
+// updateTransferBalance writes the new balance only if it still matches the one
+// we read under the lock. Zero rows means somebody moved it and we back off.
 func updateTransferBalance(ctx context.Context, tx pgx.Tx, walletID uuid.UUID, previous, updated int64) error {
 	tag, err := tx.Exec(ctx, `
 		UPDATE wallets SET balance = $1, updated_at = CURRENT_TIMESTAMP

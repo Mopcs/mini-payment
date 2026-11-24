@@ -10,6 +10,10 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
+// claimLedgerTransaction reserves (user_id, idempotency_key) for a new ledger
+// row. If the key is already taken it compares the stored request hash: a match
+// means the caller is retrying and should get the original result back, a
+// mismatch is a conflict. The bool result reports a replay.
 func claimLedgerTransaction(ctx context.Context, tx pgx.Tx, userID, transactionID uuid.UUID, transactionType, key string, requestHash []byte, sourceWalletID uuid.UUID, destinationWalletID *uuid.UUID, currency string, amount int64) (uuid.UUID, time.Time, bool, error) {
 	var createdAt time.Time
 	err := tx.QueryRow(ctx, `
@@ -29,6 +33,7 @@ func claimLedgerTransaction(ctx context.Context, tx pgx.Tx, userID, transactionI
 		return uuid.Nil, time.Time{}, false, translateError("claim transaction idempotency key", err)
 	}
 
+	// The insert conflicted, so the row is there. Find out whether it is ours.
 	var existingID uuid.UUID
 	var existingType string
 	var existingHash []byte

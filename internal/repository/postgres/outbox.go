@@ -39,6 +39,8 @@ func (r *OutboxRepository) Create(ctx context.Context, tx pgx.Tx, event domain.O
 	return nil
 }
 
+// ClaimBatch locks a batch of due events for this worker. SKIP LOCKED lets
+// several workers pull from the same table without queueing behind each other.
 func (r *OutboxRepository) ClaimBatch(ctx context.Context, workerID uuid.UUID, batchSize int, lease time.Duration) ([]domain.OutboxEvent, error) {
 	if workerID == uuid.Nil || batchSize < 1 || batchSize > 1000 || lease.Microseconds() < 1 {
 		return nil, errors.New("worker ID, positive batch size, and positive lease are required")
@@ -110,6 +112,7 @@ func (r *OutboxRepository) MarkPublished(ctx context.Context, eventID, workerID 
 	if err != nil {
 		return translateError("mark outbox event published", err)
 	}
+	// No row updated means the lease ran out and another worker took the event.
 	if tag.RowsAffected() != 1 {
 		return ErrOutboxLeaseLost
 	}
@@ -156,6 +159,8 @@ func (r *OutboxRepository) ScheduleRetry(ctx context.Context, eventID, workerID 
 	return nil
 }
 
+// truncateError cuts at a rune boundary. Postgres will not accept half a UTF-8
+// sequence in last_error, and error messages do get cut in the middle.
 func truncateError(message string, maximum int) string {
 	if len(message) <= maximum {
 		return message

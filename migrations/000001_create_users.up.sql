@@ -8,4 +8,5 @@ CREATE TABLE users (
     CONSTRAINT users_email_normalized_check CHECK (email = lower(btrim(email)))
 );
 
+-- Uniqueness is case-insensitive. The CHECK above keeps the stored value lowercase.
 CREATE UNIQUE INDEX users_email_lower_unique_idx ON users (lower(email));

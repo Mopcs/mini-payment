@@ -12,6 +12,7 @@ type TokenValidator interface {
 	Validate(string) (uuid.UUID, error)
 }
 
+// Unexported type, so no other package can overwrite the value in the context.
 type contextKey struct{}
 
 func UserID(ctx context.Context) (uuid.UUID, bool) {

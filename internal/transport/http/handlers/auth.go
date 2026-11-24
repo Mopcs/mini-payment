@@ -105,6 +105,7 @@ func (h *Auth) login(w http.ResponseWriter, r *http.Request) {
 	writeAuthResponse(w, http.StatusOK, result)
 }
 
+// Mirrors decodeJSONRequest but with its own body size limit.
 func decodeAuthRequest(w http.ResponseWriter, r *http.Request, target *credentialsRequest) *requestDecodeError {
 	contentType, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
 	if err != nil || contentType != "application/json" {

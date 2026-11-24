@@ -10,6 +10,8 @@ import (
 )
 
 func NewPool(ctx context.Context, cfg config.Config) (*pgxpool.Pool, error) {
+	// ParseConfig with an empty DSN gives us the library defaults; the real
+	// values are filled in from Config below.
 	poolConfig, err := pgxpool.ParseConfig("")
 	if err != nil {
 		return nil, err

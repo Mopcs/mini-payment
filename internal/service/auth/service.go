@@ -51,6 +51,8 @@ func (s *Service) Register(ctx context.Context, email, password string) (result 
 		return Result{}, fmt.Errorf("hash registration password: %w", err)
 	}
 
+	// User and first wallet go in together. A half-registered account would leave
+	// someone who can log in but has nowhere to deposit.
 	user := &domain.User{ID: uuid.New(), Email: normalizedEmail, PasswordHash: passwordHash}
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
@@ -103,6 +105,8 @@ func (s *Service) Login(ctx context.Context, email, password string) (Result, er
 	if err != nil {
 		return Result{}, fmt.Errorf("verify stored password hash: %w", err)
 	}
+	// Same error as an unknown email, so login never confirms which addresses
+	// are registered.
 	if !valid {
 		return Result{}, ErrInvalidCredentials
 	}

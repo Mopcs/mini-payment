@@ -87,6 +87,8 @@ func (s *Service) Deposit(ctx context.Context, userID, walletID uuid.UUID, amoun
 		return domain.Deposit{}, false, ErrInvalidIdempotencyKey
 	}
 
+	// The hash covers every field that defines the request. A retry with the same
+	// key has to hash identically; anything else is the client reusing a key.
 	requestHash := depositRequestHash(userID, walletID, amount, currency)
 	deposit, replay, err := s.deposits.Create(ctx, userID, walletID, amount, currency, idempotencyKey, requestHash[:])
 	switch {

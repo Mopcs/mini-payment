@@ -7,6 +7,7 @@ ALTER TABLE outbox_events
 
 DROP INDEX outbox_events_unpublished_poll_idx;
 
+-- Matches the claim query: unpublished events ordered by when they are due next.
 CREATE INDEX outbox_events_pending_poll_idx
     ON outbox_events (next_attempt_at, created_at, id)
     WHERE published_at IS NULL;
