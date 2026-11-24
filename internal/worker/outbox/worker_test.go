@@ -15,9 +15,12 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/prometheus/client_golang/prometheus"
+	dto "github.com/prometheus/client_model/go"
 	"github.com/rabbitmq/amqp091-go"
 
 	"github.com/Mopcs/mini-payment-system/internal/domain"
+	"github.com/Mopcs/mini-payment-system/internal/observability"
 	"github.com/Mopcs/mini-payment-system/internal/repository/postgres"
 )
 
@@ -111,7 +114,10 @@ func TestWorkerSchedulesRetryAndMarksConfirmedEvent(t *testing.T) {
 	pool := workerTestPool(t)
 	failingID, successfulID := insertWorkerTestEvent(t, pool), insertWorkerTestEvent(t, pool)
 	publisher := &fakePublisher{failures: map[uuid.UUID]error{failingID: errors.New("broker unavailable")}}
+	registry := prometheus.NewRegistry()
+	metrics := observability.NewOutboxMetrics(registry)
 	worker := newTestWorker(t, pool, publisher, 2)
+	worker.metrics = metrics
 	if reconnect := worker.processBatch(context.Background(), publisher); !reconnect {
 		t.Fatal("failed publication did not request a RabbitMQ reconnect")
 	}
@@ -125,6 +131,26 @@ func TestWorkerSchedulesRetryAndMarksConfirmedEvent(t *testing.T) {
 			t.Fatalf("failed event state: published=%t attempts=%d locked_by=%v last_error=%v next_attempt=%s", published, attempts, lockedBy, lastError, nextAttempt)
 		}
 	})
+	assertMetricValue(t, metrics.EventsClaimed, 2)
+	assertMetricValue(t, metrics.EventsPublished, 1)
+	assertMetricValue(t, metrics.PublishFailures, 1)
+	assertMetricValue(t, metrics.RetryAttempts, 1)
+	assertMetricValue(t, metrics.RunningJobs, 0)
+}
+
+func assertMetricValue(t *testing.T, metric prometheus.Metric, want float64) {
+	t.Helper()
+	data := &dto.Metric{}
+	if err := metric.Write(data); err != nil {
+		t.Fatal(err)
+	}
+	value := data.Counter.GetValue()
+	if data.Gauge != nil {
+		value = data.Gauge.GetValue()
+	}
+	if value != want {
+		t.Fatalf("metric value = %v, want %v", value, want)
+	}
 }
 
 func TestOutboxUpdatesRequireWorkerOwnership(t *testing.T) {

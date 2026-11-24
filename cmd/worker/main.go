@@ -14,6 +14,7 @@ import (
 
 	"github.com/Mopcs/mini-payment-system/internal/config"
 	"github.com/Mopcs/mini-payment-system/internal/infrastructure/postgres"
+	"github.com/Mopcs/mini-payment-system/internal/observability"
 	"github.com/Mopcs/mini-payment-system/internal/worker/outbox"
 )
 
@@ -44,13 +45,51 @@ func run(cfg config.Config, logger *slog.Logger) error {
 		return fmt.Errorf("connect to PostgreSQL: %w", err)
 	}
 
+	workerMetrics, metricsServer, err := startWorkerMetrics(cfg, pool, logger)
+	if err != nil {
+		return err
+	}
+	defer metricsServer.Shutdown()
+
+	worker, err := newWorker(cfg, pool, logger, workerMetrics)
+	if err != nil {
+		return err
+	}
+	if err := worker.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+		return fmt.Errorf("run outbox worker: %w", err)
+	}
+	return nil
+}
+
+func startWorkerMetrics(
+	cfg config.Config,
+	pool *pgxpool.Pool,
+	logger *slog.Logger,
+) (*observability.OutboxMetrics, *observability.MetricsServer, error) {
+	registry := observability.NewRegistry()
+	registry.MustRegister(observability.NewPGXPoolCollector(pool))
+	workerMetrics := observability.NewOutboxMetrics(registry)
+	metricsServer, err := observability.StartMetricsServer(cfg.WorkerMetricsAddr, registry, logger)
+	if err != nil {
+		return nil, nil, err
+	}
+	return workerMetrics, metricsServer, nil
+}
+
+func newWorker(
+	cfg config.Config,
+	pool *pgxpool.Pool,
+	logger *slog.Logger,
+	metrics *observability.OutboxMetrics,
+) (*outbox.Worker, error) {
 	settings := outbox.Settings{
 		BatchSize:     cfg.OutboxBatchSize,
 		PollInterval:  cfg.OutboxPollInterval,
 		LeaseDuration: cfg.OutboxLeaseDuration,
 		MaxBackoff:    cfg.OutboxMaxBackoff,
+		Metrics:       metrics,
 	}
-	worker, err := outbox.New(pool, settings, func(ctx context.Context) (outbox.Publisher, error) {
+	return outbox.New(pool, settings, func(ctx context.Context) (outbox.Publisher, error) {
 		return outbox.NewRabbitPublisher(ctx, outbox.RabbitSettings{
 			URL:        cfg.RabbitMQURL,
 			Exchange:   cfg.RabbitMQExchange,
@@ -58,13 +97,6 @@ func run(cfg config.Config, logger *slog.Logger) error {
 			RoutingKey: cfg.RabbitMQRoutingKey,
 		})
 	}, logger)
-	if err != nil {
-		return fmt.Errorf("configure outbox worker: %w", err)
-	}
-	if err := worker.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
-		return fmt.Errorf("run outbox worker: %w", err)
-	}
-	return nil
 }
 
 func pingPool(ctx context.Context, pool *pgxpool.Pool) error {
