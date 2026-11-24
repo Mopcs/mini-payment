@@ -38,7 +38,10 @@ func NewService(pool *pgxpool.Pool, tokens *TokenManager) *Service {
 	return &Service{pool: pool, tokens: tokens}
 }
 
-func (s *Service) Register(ctx context.Context, email, password string) (result Result, returnedErr error) {
+func (s *Service) Register(
+	ctx context.Context,
+	email, password string,
+) (result Result, returnedErr error) {
 	normalizedEmail, err := normalizeAndValidateEmail(email)
 	if err != nil {
 		return Result{}, err

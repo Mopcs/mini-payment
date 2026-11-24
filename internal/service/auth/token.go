@@ -48,8 +48,17 @@ func (m *TokenManager) Validate(encoded string) (uuid.UUID, error) {
 			return nil, ErrInvalidToken
 		}
 		return m.secret, nil
-	}, jwt.WithValidMethods([]string{jwt.SigningMethodHS256.Alg()}), jwt.WithIssuer(m.issuer), jwt.WithExpirationRequired(), jwt.WithIssuedAt())
-	if err != nil || token == nil || !token.Valid || claims.IssuedAt == nil || claims.ExpiresAt == nil {
+	},
+		jwt.WithValidMethods([]string{jwt.SigningMethodHS256.Alg()}),
+		jwt.WithIssuer(m.issuer),
+		jwt.WithExpirationRequired(),
+		jwt.WithIssuedAt(),
+	)
+	if err != nil ||
+		token == nil ||
+		!token.Valid ||
+		claims.IssuedAt == nil ||
+		claims.ExpiresAt == nil {
 		return uuid.Nil, ErrInvalidToken
 	}
 	subject, err := uuid.Parse(claims.Subject)

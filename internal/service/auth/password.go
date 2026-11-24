@@ -52,7 +52,14 @@ func VerifyPassword(password, encodedHash string) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	actual := argon2.IDKey([]byte(password), salt, params.time, params.memory, params.threads, uint32(len(expected)))
+	actual := argon2.IDKey(
+		[]byte(password),
+		salt,
+		params.time,
+		params.memory,
+		params.threads,
+		uint32(len(expected)),
+	)
 	// Constant time, so the response doesn't leak how much of the hash matched.
 	return subtle.ConstantTimeCompare(actual, expected) == 1, nil
 }
@@ -131,5 +138,7 @@ func parseArgonParameters(encoded string) (argonParameters, error) {
 }
 
 func validPasswordLength(password string) bool {
-	return utf8.ValidString(password) && len(password) <= maxPasswordBytes && utf8.RuneCountInString(password) >= minPasswordRunes
+	return utf8.ValidString(password) &&
+		len(password) <= maxPasswordBytes &&
+		utf8.RuneCountInString(password) >= minPasswordRunes
 }
