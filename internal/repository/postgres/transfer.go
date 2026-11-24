@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"math"
 	"strings"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -15,6 +16,17 @@ import (
 	"github.com/Mopcs/mini-payment-system/internal/dbutil"
 	"github.com/Mopcs/mini-payment-system/internal/domain"
 )
+
+// TransferRequest carries one validated transfer attempt.
+type TransferRequest struct {
+	UserID         uuid.UUID
+	SourceID       uuid.UUID
+	DestinationID  uuid.UUID
+	Amount         int64
+	Currency       string
+	IdempotencyKey string
+	RequestHash    []byte
+}
 
 type TransferRepository struct {
 	pool   *pgxpool.Pool
@@ -27,15 +39,29 @@ func NewTransferRepository(pool *pgxpool.Pool) *TransferRepository {
 
 // Conditions shared by the history queries. $1 is always the user ID.
 const (
-	transferVisibleToUser = `(EXISTS (SELECT 1 FROM wallets sw WHERE sw.id = lt.wallet_id AND sw.user_id = $1)
-		OR EXISTS (SELECT 1 FROM wallets dw WHERE dw.id = lt.destination_wallet_id AND dw.user_id = $1))`
-	transferOutgoingFromUser = `EXISTS (SELECT 1 FROM wallets sw WHERE sw.id = lt.wallet_id AND sw.user_id = $1)`
-	transferIncomingToUser   = `EXISTS (SELECT 1 FROM wallets dw WHERE dw.id = lt.destination_wallet_id AND dw.user_id = $1)`
+	transferVisibleToUser = `(EXISTS (
+			SELECT 1 FROM wallets sw WHERE sw.id = lt.wallet_id AND sw.user_id = $1
+		) OR EXISTS (
+			SELECT 1 FROM wallets dw
+			WHERE dw.id = lt.destination_wallet_id AND dw.user_id = $1
+		))`
+	transferOutgoingFromUser = `EXISTS (
+		SELECT 1 FROM wallets sw WHERE sw.id = lt.wallet_id AND sw.user_id = $1)`
+	transferIncomingToUser = `EXISTS (
+		SELECT 1 FROM wallets dw
+		WHERE dw.id = lt.destination_wallet_id AND dw.user_id = $1)`
 )
 
-func (r *TransferRepository) List(ctx context.Context, userID uuid.UUID, filter domain.TransferHistoryFilter) ([]domain.TransferHistoryItem, int64, error) {
+func (r *TransferRepository) List(
+	ctx context.Context,
+	userID uuid.UUID,
+	filter domain.TransferHistoryFilter,
+) ([]domain.TransferHistoryItem, int64, error) {
 	// One snapshot for both the count and the page, so total always matches items.
-	tx, err := r.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
+	tx, err := r.pool.BeginTx(ctx, pgx.TxOptions{
+		IsoLevel:   pgx.RepeatableRead,
+		AccessMode: pgx.ReadOnly,
+	})
 	if err != nil {
 		return nil, 0, fmt.Errorf("begin transfer history transaction: %w", err)
 	}
@@ -59,7 +85,11 @@ func (r *TransferRepository) List(ctx context.Context, userID uuid.UUID, filter 
 	return items, total, nil
 }
 
-func (r *TransferRepository) Count(ctx context.Context, userID uuid.UUID, filter domain.TransferHistoryFilter) (int64, error) {
+func (r *TransferRepository) Count(
+	ctx context.Context,
+	userID uuid.UUID,
+	filter domain.TransferHistoryFilter,
+) (int64, error) {
 	where, args := transferHistoryWhere(userID, filter)
 	return countTransferHistory(ctx, r.pool, where, args)
 }
@@ -68,15 +98,27 @@ type transferHistoryQuery interface {
 	QueryRow(context.Context, string, ...any) pgx.Row
 }
 
-func countTransferHistory(ctx context.Context, query transferHistoryQuery, where string, args []any) (int64, error) {
+func countTransferHistory(
+	ctx context.Context,
+	query transferHistoryQuery,
+	where string,
+	args []any,
+) (int64, error) {
 	var total int64
-	if err := query.QueryRow(ctx, `SELECT count(*) FROM ledger_transactions lt `+where, args...).Scan(&total); err != nil {
+	row := query.QueryRow(ctx, `SELECT count(*) FROM ledger_transactions lt `+where, args...)
+	if err := row.Scan(&total); err != nil {
 		return 0, translateError("count transfer history", err)
 	}
 	return total, nil
 }
 
-func selectTransferHistory(ctx context.Context, tx pgx.Tx, where string, args []any, filter domain.TransferHistoryFilter) ([]domain.TransferHistoryItem, error) {
+func selectTransferHistory(
+	ctx context.Context,
+	tx pgx.Tx,
+	where string,
+	args []any,
+	filter domain.TransferHistoryFilter,
+) ([]domain.TransferHistoryItem, error) {
 	limitArg := len(args) + 1
 	offsetArg := limitArg + 1
 	args = append(args, filter.Limit, filter.Offset)
@@ -111,7 +153,10 @@ func selectTransferHistory(ctx context.Context, tx pgx.Tx, where string, args []
 	return items, nil
 }
 
-func transferHistoryWhere(userID uuid.UUID, filter domain.TransferHistoryFilter) (string, []any) {
+func transferHistoryWhere(
+	userID uuid.UUID,
+	filter domain.TransferHistoryFilter,
+) (string, []any) {
 	conditions := []string{
 		"lt.transaction_type = 'transfer'",
 		transferVisibleToUser,
@@ -133,61 +178,39 @@ func transferHistoryWhere(userID uuid.UUID, filter domain.TransferHistoryFilter)
 	return "WHERE " + strings.Join(conditions, " AND "), args
 }
 
-func (r *TransferRepository) Create(ctx context.Context, userID, sourceID, destinationID uuid.UUID, amount int64, currency, key string, requestHash []byte) (result domain.Transfer, replay bool, returnedErr error) {
+// Create moves the money and queues the outbox event in one transaction, so a
+// rolled back transfer can never be published.
+func (r *TransferRepository) Create(
+	ctx context.Context,
+	request TransferRequest,
+) (result domain.Transfer, replay bool, returnedErr error) {
 	tx, err := r.pool.Begin(ctx)
 	if err != nil {
 		return domain.Transfer{}, false, fmt.Errorf("begin transfer transaction: %w", err)
 	}
 	defer dbutil.Rollback(ctx, tx, &returnedErr)
 
-	plan := transferPlan{
-		userID:        userID,
-		sourceID:      sourceID,
-		destinationID: destinationID,
-		amount:        amount,
-		currency:      currency,
-	}
-
-	transactionID, createdAt, replay, err := claimLedgerTransaction(ctx, tx, ledgerTransaction{
-		id:                  uuid.New(),
-		userID:              userID,
-		transactionType:     "transfer",
-		idempotencyKey:      key,
-		requestHash:         requestHash,
-		sourceWalletID:      sourceID,
-		destinationWalletID: &destinationID,
-		currency:            currency,
-		amount:              amount,
-	})
+	transactionID, createdAt, replay, err := claimTransfer(ctx, tx, request)
 	if err != nil {
-		return domain.Transfer{}, false, fmt.Errorf("claim transfer idempotency key: %w", err)
+		return domain.Transfer{}, false, err
 	}
 	if replay {
 		return replayTransfer(ctx, tx, transactionID)
 	}
 
-	source, destination, err := lockTransferWallets(ctx, tx, plan)
+	balances, err := settleTransfer(ctx, tx, transactionID, request)
 	if err != nil {
-		return domain.Transfer{}, false, err
-	}
-
-	sourceAfter, destinationAfter, err := applyTransfer(ctx, tx, transactionID, plan, source, destination)
-	if err != nil {
-		return domain.Transfer{}, false, err
-	}
-
-	if err := verifyLedgerBalanced(ctx, tx, transactionID, 2); err != nil {
 		return domain.Transfer{}, false, err
 	}
 
 	result = domain.Transfer{
 		TransactionID:           transactionID,
-		SourceWalletID:          sourceID,
-		DestinationWalletID:     destinationID,
-		Amount:                  amount,
-		Currency:                currency,
-		SourceBalanceAfter:      sourceAfter,
-		DestinationBalanceAfter: destinationAfter,
+		SourceWalletID:          request.SourceID,
+		DestinationWalletID:     request.DestinationID,
+		Amount:                  request.Amount,
+		Currency:                request.Currency,
+		SourceBalanceAfter:      balances.source,
+		DestinationBalanceAfter: balances.destination,
 		CreatedAt:               createdAt,
 	}
 
@@ -201,8 +224,36 @@ func (r *TransferRepository) Create(ctx context.Context, userID, sourceID, desti
 	return result, false, nil
 }
 
+func claimTransfer(
+	ctx context.Context,
+	tx pgx.Tx,
+	request TransferRequest,
+) (uuid.UUID, time.Time, bool, error) {
+	destinationID := request.DestinationID
+	transactionID, createdAt, replay, err := claimLedgerTransaction(ctx, tx, ledgerTransaction{
+		id:                  uuid.New(),
+		userID:              request.UserID,
+		transactionType:     "transfer",
+		idempotencyKey:      request.IdempotencyKey,
+		requestHash:         request.RequestHash,
+		sourceWalletID:      request.SourceID,
+		destinationWalletID: &destinationID,
+		currency:            request.Currency,
+		amount:              request.Amount,
+	})
+	if err != nil {
+		return uuid.Nil, time.Time{}, false,
+			fmt.Errorf("claim transfer idempotency key: %w", err)
+	}
+	return transactionID, createdAt, replay, nil
+}
+
 // replayTransfer loads the result of a request that was already applied.
-func replayTransfer(ctx context.Context, tx pgx.Tx, transactionID uuid.UUID) (domain.Transfer, bool, error) {
+func replayTransfer(
+	ctx context.Context,
+	tx pgx.Tx,
+	transactionID uuid.UUID,
+) (domain.Transfer, bool, error) {
 	var existing domain.Transfer
 	err := tx.QueryRow(ctx, `
 		SELECT id, wallet_id, destination_wallet_id, amount, currency,
@@ -211,9 +262,14 @@ func replayTransfer(ctx context.Context, tx pgx.Tx, transactionID uuid.UUID) (do
 		WHERE id = $1`,
 		transactionID,
 	).Scan(
-		&existing.TransactionID, &existing.SourceWalletID, &existing.DestinationWalletID,
-		&existing.Amount, &existing.Currency, &existing.SourceBalanceAfter,
-		&existing.DestinationBalanceAfter, &existing.CreatedAt,
+		&existing.TransactionID,
+		&existing.SourceWalletID,
+		&existing.DestinationWalletID,
+		&existing.Amount,
+		&existing.Currency,
+		&existing.SourceBalanceAfter,
+		&existing.DestinationBalanceAfter,
+		&existing.CreatedAt,
 	)
 	if err != nil {
 		return domain.Transfer{}, false, translateError("load transfer result", err)
@@ -225,8 +281,7 @@ func replayTransfer(ctx context.Context, tx pgx.Tx, transactionID uuid.UUID) (do
 	return existing, true, nil
 }
 
-// transferPlan is the validated request. Every step below works on the same
-// values, and passing them as one struct keeps the helpers short.
+// transferPlan is the validated request in the shape the steps below need.
 type transferPlan struct {
 	userID        uuid.UUID
 	sourceID      uuid.UUID
@@ -235,15 +290,59 @@ type transferPlan struct {
 	currency      string
 }
 
+func (r TransferRequest) plan() transferPlan {
+	return transferPlan{
+		userID:        r.UserID,
+		sourceID:      r.SourceID,
+		destinationID: r.DestinationID,
+		amount:        r.Amount,
+		currency:      r.Currency,
+	}
+}
+
 type lockedTransferWallet struct {
 	userID   uuid.UUID
 	currency string
 	balance  int64
 }
 
+type transferBalances struct {
+	source      int64
+	destination int64
+}
+
+// settleTransfer locks both wallets, moves the money, and checks the books
+// before the caller commits.
+func settleTransfer(
+	ctx context.Context,
+	tx pgx.Tx,
+	transactionID uuid.UUID,
+	request TransferRequest,
+) (transferBalances, error) {
+	plan := request.plan()
+	source, destination, err := lockTransferWallets(ctx, tx, plan)
+	if err != nil {
+		return transferBalances{}, err
+	}
+
+	balances, err := applyTransfer(ctx, tx, transactionID, plan, source, destination)
+	if err != nil {
+		return transferBalances{}, err
+	}
+
+	if err := verifyLedgerBalanced(ctx, tx, transactionID, 2); err != nil {
+		return transferBalances{}, err
+	}
+	return balances, nil
+}
+
 // lockTransferWallets locks both wallet rows in UUID order so A->B and B->A
 // cannot deadlock each other, then checks that the transfer is allowed.
-func lockTransferWallets(ctx context.Context, tx pgx.Tx, plan transferPlan) (lockedTransferWallet, lockedTransferWallet, error) {
+func lockTransferWallets(
+	ctx context.Context,
+	tx pgx.Tx,
+	plan transferPlan,
+) (lockedTransferWallet, lockedTransferWallet, error) {
 	first, second := plan.sourceID, plan.destinationID
 	if bytes.Compare(first[:], second[:]) > 0 {
 		first, second = second, first
@@ -263,27 +362,41 @@ func lockTransferWallets(ctx context.Context, tx pgx.Tx, plan transferPlan) (loc
 	source, sourceExists := locked[plan.sourceID]
 	destination, destinationExists := locked[plan.destinationID]
 
-	// A missing wallet and somebody else's wallet report the same error, so the
-	// caller cannot probe for wallets they do not own.
-	if !sourceExists || !destinationExists {
-		return lockedTransferWallet{}, lockedTransferWallet{}, ErrTransferWalletNotFound
-	}
-	if source.userID != plan.userID {
-		return lockedTransferWallet{}, lockedTransferWallet{}, ErrTransferSourceNotOwned
-	}
-	if source.currency != plan.currency || destination.currency != plan.currency {
-		return lockedTransferWallet{}, lockedTransferWallet{}, ErrTransferCurrencyMismatch
-	}
-	if plan.amount > source.balance {
-		return lockedTransferWallet{}, lockedTransferWallet{}, ErrInsufficientFunds
-	}
-	if plan.amount > math.MaxInt64-destination.balance { // would wrap the destination
-		return lockedTransferWallet{}, lockedTransferWallet{}, ErrBalanceOverflow
+	err := checkTransferAllowed(plan, source, destination, sourceExists, destinationExists)
+	if err != nil {
+		return lockedTransferWallet{}, lockedTransferWallet{}, err
 	}
 	return source, destination, nil
 }
 
-func lockTransferWallet(ctx context.Context, tx pgx.Tx, walletID uuid.UUID) (lockedTransferWallet, bool, error) {
+// checkTransferAllowed reports the first rule the transfer breaks. A missing
+// wallet and somebody else's wallet share one error, so the caller cannot probe
+// for wallets they do not own.
+func checkTransferAllowed(
+	plan transferPlan,
+	source, destination lockedTransferWallet,
+	sourceExists, destinationExists bool,
+) error {
+	switch {
+	case !sourceExists || !destinationExists:
+		return ErrTransferWalletNotFound
+	case source.userID != plan.userID:
+		return ErrTransferSourceNotOwned
+	case source.currency != plan.currency || destination.currency != plan.currency:
+		return ErrTransferCurrencyMismatch
+	case plan.amount > source.balance:
+		return ErrInsufficientFunds
+	case plan.amount > math.MaxInt64-destination.balance: // would wrap the destination
+		return ErrBalanceOverflow
+	}
+	return nil
+}
+
+func lockTransferWallet(
+	ctx context.Context,
+	tx pgx.Tx,
+	walletID uuid.UUID,
+) (lockedTransferWallet, bool, error) {
 	var wallet lockedTransferWallet
 	err := tx.QueryRow(ctx, `
 		SELECT user_id, currency, balance
@@ -303,49 +416,109 @@ func lockTransferWallet(ctx context.Context, tx pgx.Tx, walletID uuid.UUID) (loc
 
 // applyTransfer moves the money: both wallet balances, the transaction row, and
 // the two ledger entries.
-func applyTransfer(ctx context.Context, tx pgx.Tx, transactionID uuid.UUID, plan transferPlan, source, destination lockedTransferWallet) (int64, int64, error) {
+func applyTransfer(
+	ctx context.Context,
+	tx pgx.Tx,
+	transactionID uuid.UUID,
+	plan transferPlan,
+	source, destination lockedTransferWallet,
+) (transferBalances, error) {
 	sourceAccountID, err := walletLedgerAccount(ctx, tx, plan.sourceID, plan.currency)
 	if err != nil {
-		return 0, 0, err
+		return transferBalances{}, err
 	}
 	destinationAccountID, err := walletLedgerAccount(ctx, tx, plan.destinationID, plan.currency)
 	if err != nil {
-		return 0, 0, err
+		return transferBalances{}, err
 	}
 
-	sourceAfter := source.balance - plan.amount
-	destinationAfter := destination.balance + plan.amount
-
-	if err := updateWalletBalance(ctx, tx, plan.sourceID, source.balance, sourceAfter); err != nil {
-		return 0, 0, fmt.Errorf("debit transfer source: %w", err)
-	}
-	if err := updateWalletBalance(ctx, tx, plan.destinationID, destination.balance, destinationAfter); err != nil {
-		return 0, 0, fmt.Errorf("credit transfer destination: %w", err)
+	balances := transferBalances{
+		source:      source.balance - plan.amount,
+		destination: destination.balance + plan.amount,
 	}
 
-	if _, err := tx.Exec(ctx, `
+	err = moveTransferBalances(ctx, tx, plan, source, destination, balances)
+	if err != nil {
+		return transferBalances{}, err
+	}
+
+	err = storeTransferResult(ctx, tx, transactionID, plan, balances)
+	if err != nil {
+		return transferBalances{}, err
+	}
+
+	err = writeTransferEntries(
+		ctx, tx, transactionID, plan, sourceAccountID, destinationAccountID,
+	)
+	if err != nil {
+		return transferBalances{}, err
+	}
+	return balances, nil
+}
+
+func moveTransferBalances(
+	ctx context.Context,
+	tx pgx.Tx,
+	plan transferPlan,
+	source, destination lockedTransferWallet,
+	balances transferBalances,
+) error {
+	err := updateWalletBalance(ctx, tx, plan.sourceID, source.balance, balances.source)
+	if err != nil {
+		return fmt.Errorf("debit transfer source: %w", err)
+	}
+
+	err = updateWalletBalance(ctx, tx, plan.destinationID, destination.balance, balances.destination)
+	if err != nil {
+		return fmt.Errorf("credit transfer destination: %w", err)
+	}
+	return nil
+}
+
+func storeTransferResult(
+	ctx context.Context,
+	tx pgx.Tx,
+	transactionID uuid.UUID,
+	plan transferPlan,
+	balances transferBalances,
+) error {
+	_, err := tx.Exec(ctx, `
 		UPDATE ledger_transactions
 		SET balance_after = $1, destination_balance_after = $2
 		WHERE id = $3`,
-		sourceAfter, destinationAfter, transactionID,
-	); err != nil {
-		return 0, 0, translateError("store transfer result", err)
+		balances.source, balances.destination, transactionID,
+	)
+	if err != nil {
+		return translateError("store transfer result", err)
 	}
+	return nil
+}
 
-	if _, err := tx.Exec(ctx, `
+func writeTransferEntries(
+	ctx context.Context,
+	tx pgx.Tx,
+	transactionID uuid.UUID,
+	plan transferPlan,
+	sourceAccountID, destinationAccountID uuid.UUID,
+) error {
+	_, err := tx.Exec(ctx, `
 		INSERT INTO ledger_entries (transaction_id, account_id, amount)
 		VALUES ($1, $2, $3), ($1, $4, $5)`,
 		transactionID, sourceAccountID, -plan.amount, destinationAccountID, plan.amount,
-	); err != nil {
-		return 0, 0, translateError("write transfer ledger entries", err)
+	)
+	if err != nil {
+		return translateError("write transfer ledger entries", err)
 	}
-
-	return sourceAfter, destinationAfter, nil
+	return nil
 }
 
 // recordCompleted queues the transfer.completed event in the same transaction,
 // so the outbox worker can never publish a transfer that was rolled back.
-func (r *TransferRepository) recordCompleted(ctx context.Context, tx pgx.Tx, transfer domain.Transfer) error {
+func (r *TransferRepository) recordCompleted(
+	ctx context.Context,
+	tx pgx.Tx,
+	transfer domain.Transfer,
+) error {
 	return r.outbox.Create(ctx, tx, domain.OutboxEvent{
 		ID:            uuid.New(),
 		AggregateID:   transfer.TransactionID,

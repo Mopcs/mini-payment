@@ -26,7 +26,12 @@ func NewNotificationRepository(pool *pgxpool.Pool) *NotificationRepository {
 // ProcessTransferCompleted records a transfer event and its notifications
 // atomically. The bool result reports a duplicate delivery, which is not an
 // error: the message was already handled by an earlier consumer run.
-func (r *NotificationRepository) ProcessTransferCompleted(ctx context.Context, eventID uuid.UUID, eventType string, payload domain.TransferCompletedPayload) (duplicate bool, returnedErr error) {
+func (r *NotificationRepository) ProcessTransferCompleted(
+	ctx context.Context,
+	eventID uuid.UUID,
+	eventType string,
+	payload domain.TransferCompletedPayload,
+) (duplicate bool, returnedErr error) {
 	tx, err := r.pool.Begin(ctx)
 	if err != nil {
 		return false, fmt.Errorf("begin event transaction: %w", err)
@@ -44,32 +49,53 @@ func (r *NotificationRepository) ProcessTransferCompleted(ctx context.Context, e
 		return true, nil
 	}
 
-	if eventType != domain.EventTypeTransferCompleted {
-		return false, fmt.Errorf("%w: unsupported event type", ErrInvalidTransferEvent)
-	}
-
-	if err := verifySourceEvent(ctx, tx, eventID, eventType, payload); err != nil {
+	if err := recordTransferEvent(ctx, tx, eventID, eventType, payload); err != nil {
 		return false, err
-	}
-
-	record, err := loadTransferRecord(ctx, tx, payload.TransferID)
-	if err != nil {
-		return false, err
-	}
-	if !record.matches(payload) {
-		return false, fmt.Errorf("%w: transfer fields do not match", ErrInvalidTransferEvent)
-	}
-
-	for _, recipient := range record.recipients() {
-		if err := insertNotification(ctx, tx, eventID, payload.TransferID, recipient, record); err != nil {
-			return false, err
-		}
 	}
 
 	if err := tx.Commit(ctx); err != nil {
 		return false, translateError("commit event transaction", err)
 	}
 	return false, nil
+}
+
+// recordTransferEvent checks the message against the outbox row that produced
+// it, then writes one notification per wallet owner.
+func recordTransferEvent(
+	ctx context.Context,
+	tx pgx.Tx,
+	eventID uuid.UUID,
+	eventType string,
+	payload domain.TransferCompletedPayload,
+) error {
+	if eventType != domain.EventTypeTransferCompleted {
+		return fmt.Errorf("%w: unsupported event type", ErrInvalidTransferEvent)
+	}
+
+	if err := verifySourceEvent(ctx, tx, eventID, eventType, payload); err != nil {
+		return err
+	}
+
+	record, err := loadTransferRecord(ctx, tx, payload.TransferID)
+	if err != nil {
+		return err
+	}
+	if !record.matches(payload) {
+		return fmt.Errorf("%w: transfer fields do not match", ErrInvalidTransferEvent)
+	}
+
+	for _, recipient := range record.recipients() {
+		entry := notificationInput{
+			eventID:    eventID,
+			transferID: payload.TransferID,
+			recipient:  recipient,
+			record:     record,
+		}
+		if err := insertNotification(ctx, tx, entry); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // claimEvent marks the event as processed and reports whether it was already
@@ -88,7 +114,13 @@ func claimEvent(ctx context.Context, tx pgx.Tx, eventID uuid.UUID, eventType str
 
 // verifySourceEvent compares the message with the outbox row that produced it,
 // so a forged or edited payload cannot create notifications.
-func verifySourceEvent(ctx context.Context, tx pgx.Tx, eventID uuid.UUID, eventType string, payload domain.TransferCompletedPayload) error {
+func verifySourceEvent(
+	ctx context.Context,
+	tx pgx.Tx,
+	eventID uuid.UUID,
+	eventType string,
+	payload domain.TransferCompletedPayload,
+) error {
 	var aggregateID uuid.UUID
 	var aggregateType, storedEventType string
 	var raw []byte
@@ -129,7 +161,11 @@ type transferRecord struct {
 	completedAt         time.Time
 }
 
-func loadTransferRecord(ctx context.Context, tx pgx.Tx, transferID uuid.UUID) (transferRecord, error) {
+func loadTransferRecord(
+	ctx context.Context,
+	tx pgx.Tx,
+	transferID uuid.UUID,
+) (transferRecord, error) {
 	var record transferRecord
 
 	err := tx.QueryRow(ctx, `
@@ -179,12 +215,20 @@ func (t transferRecord) recipients() []notificationRecipient {
 	}
 }
 
-func insertNotification(ctx context.Context, tx pgx.Tx, eventID, transferID uuid.UUID, recipient notificationRecipient, record transferRecord) error {
+// notificationInput is everything one notification row needs.
+type notificationInput struct {
+	eventID    uuid.UUID
+	transferID uuid.UUID
+	recipient  notificationRecipient
+	record     transferRecord
+}
+
+func insertNotification(ctx context.Context, tx pgx.Tx, input notificationInput) error {
 	body, err := json.Marshal(domain.TransferNotificationPayload{
-		TransferID: transferID,
-		Amount:     record.amount,
-		Currency:   record.currency,
-		Direction:  recipient.direction,
+		TransferID: input.transferID,
+		Amount:     input.record.amount,
+		Currency:   input.record.currency,
+		Direction:  input.recipient.direction,
 	})
 	if err != nil {
 		return fmt.Errorf("encode notification payload: %w", err)
@@ -193,7 +237,7 @@ func insertNotification(ctx context.Context, tx pgx.Tx, eventID, transferID uuid
 	if _, err := tx.Exec(ctx, `
 		INSERT INTO notifications (id, user_id, transfer_id, event_id, notification_type, payload)
 		VALUES ($1, $2, $3, $4, $5, $6)`,
-		uuid.New(), recipient.userID, transferID, eventID,
+		uuid.New(), input.recipient.userID, input.transferID, input.eventID,
 		domain.NotificationTypeTransferCompleted, body,
 	); err != nil {
 		return translateError("create transfer notification", err)

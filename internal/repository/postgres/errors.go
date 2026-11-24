@@ -29,7 +29,9 @@ var (
 	ErrTransferSourceNotOwned   = errors.New("source wallet is not owned by user")
 	ErrTransferCurrencyMismatch = errors.New("transfer wallet currency mismatch")
 	ErrInsufficientFunds        = errors.New("insufficient wallet funds")
-	ErrWalletBalanceChanged     = errors.New("wallet balance changed while the transaction was in flight")
+	ErrWalletBalanceChanged     = errors.New(
+		"wallet balance changed while the transaction was in flight",
+	)
 )
 
 type databaseOperationError struct {

@@ -10,7 +10,12 @@ import (
 )
 
 // walletLedgerAccount returns the ledger account that backs a wallet.
-func walletLedgerAccount(ctx context.Context, tx pgx.Tx, walletID uuid.UUID, currency string) (uuid.UUID, error) {
+func walletLedgerAccount(
+	ctx context.Context,
+	tx pgx.Tx,
+	walletID uuid.UUID,
+	currency string,
+) (uuid.UUID, error) {
 	var accountID uuid.UUID
 	err := tx.QueryRow(ctx, `
 		SELECT id FROM ledger_accounts
@@ -46,7 +51,12 @@ func systemFundingAccount(ctx context.Context, tx pgx.Tx, currency string) (uuid
 // verifyLedgerBalanced is the last check before commit: the transaction must
 // have exactly the expected number of entries, they must cancel out, and they
 // must all belong to one currency.
-func verifyLedgerBalanced(ctx context.Context, tx pgx.Tx, transactionID uuid.UUID, expectedEntries int) error {
+func verifyLedgerBalanced(
+	ctx context.Context,
+	tx pgx.Tx,
+	transactionID uuid.UUID,
+	expectedEntries int,
+) error {
 	var balanced bool
 	err := tx.QueryRow(ctx, `
 		SELECT count(*) = $2
@@ -69,7 +79,12 @@ func verifyLedgerBalanced(ctx context.Context, tx pgx.Tx, transactionID uuid.UUI
 // updateWalletBalance writes the new balance only if it still matches the value
 // read under the lock. Zero rows means somebody else moved the wallet, so we
 // back out instead of overwriting their change.
-func updateWalletBalance(ctx context.Context, tx pgx.Tx, walletID uuid.UUID, previous, updated int64) error {
+func updateWalletBalance(
+	ctx context.Context,
+	tx pgx.Tx,
+	walletID uuid.UUID,
+	previous, updated int64,
+) error {
 	tag, err := tx.Exec(ctx, `
 		UPDATE wallets SET balance = $1, updated_at = CURRENT_TIMESTAMP
 		WHERE id = $2 AND balance = $3`,

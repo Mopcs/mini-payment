@@ -29,7 +29,11 @@ type ledgerTransaction struct {
 // row. If the key is already taken it compares the stored request hash: a match
 // means the caller is retrying and should get the original result back, a
 // mismatch is a conflict. The bool result reports a replay.
-func claimLedgerTransaction(ctx context.Context, tx pgx.Tx, entry ledgerTransaction) (uuid.UUID, time.Time, bool, error) {
+func claimLedgerTransaction(
+	ctx context.Context,
+	tx pgx.Tx,
+	entry ledgerTransaction,
+) (uuid.UUID, time.Time, bool, error) {
 	var transactionID uuid.UUID
 	var createdAt time.Time
 
@@ -50,12 +54,22 @@ func claimLedgerTransaction(ctx context.Context, tx pgx.Tx, entry ledgerTransact
 	if !errors.Is(err, pgx.ErrNoRows) {
 		return uuid.Nil, time.Time{}, false, translateError("claim transaction idempotency key", err)
 	}
+	return replayLedgerTransaction(ctx, tx, entry)
+}
 
-	// The insert conflicted, so the row is there. Find out whether it is ours.
+// replayLedgerTransaction handles the conflict branch: the row is there, so the
+// question is whether it belongs to this request.
+func replayLedgerTransaction(
+	ctx context.Context,
+	tx pgx.Tx,
+	entry ledgerTransaction,
+) (uuid.UUID, time.Time, bool, error) {
 	var existingID uuid.UUID
 	var existingType string
 	var existingHash []byte
-	err = tx.QueryRow(ctx, `
+	var createdAt time.Time
+
+	err := tx.QueryRow(ctx, `
 		SELECT id, transaction_type, request_hash, created_at
 		FROM ledger_transactions
 		WHERE user_id = $1 AND idempotency_key = $2`,
