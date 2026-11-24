@@ -82,6 +82,14 @@ func (s *Service) Transfer(ctx context.Context, userID, sourceWalletID, destinat
 	}
 }
 
+func (s *Service) List(ctx context.Context, userID uuid.UUID, filter domain.TransferHistoryFilter) ([]domain.TransferHistoryItem, int64, error) {
+	items, total, err := s.repository.List(ctx, userID, filter)
+	if err != nil {
+		return nil, 0, fmt.Errorf("list transfer history: %w", err)
+	}
+	return items, total, nil
+}
+
 func transferRequestHash(userID, sourceWalletID, destinationWalletID uuid.UUID, amount int64, currency string) [sha256.Size]byte {
 	var request [8 + 16 + 16 + 16 + 8 + 3]byte
 	copy(request[:8], "transfer")

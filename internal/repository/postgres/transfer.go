@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -21,6 +22,84 @@ type TransferRepository struct {
 
 func NewTransferRepository(pool *pgxpool.Pool) *TransferRepository {
 	return &TransferRepository{pool: pool}
+}
+
+func (r *TransferRepository) List(ctx context.Context, userID uuid.UUID, filter domain.TransferHistoryFilter) ([]domain.TransferHistoryItem, int64, error) {
+	tx, err := r.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
+	if err != nil {
+		return nil, 0, fmt.Errorf("begin transfer history transaction: %w", err)
+	}
+	defer tx.Rollback(context.WithoutCancel(ctx))
+
+	where, args := transferHistoryWhere(userID, filter)
+	total, err := countTransferHistory(ctx, tx, where, args)
+	if err != nil {
+		return nil, 0, err
+	}
+	args = append(args, filter.Limit, filter.Offset)
+	rows, err := tx.Query(ctx, `
+		SELECT lt.id, lt.wallet_id, lt.destination_wallet_id, lt.amount,
+		       lt.currency, lt.created_at
+		FROM ledger_transactions lt
+		`+where+`
+		ORDER BY lt.created_at DESC, lt.id DESC
+		LIMIT $`+fmt.Sprint(len(args)-1)+` OFFSET $`+fmt.Sprint(len(args)), args...)
+	if err != nil {
+		return nil, 0, translateError("list transfer history", err)
+	}
+	defer rows.Close()
+	items := make([]domain.TransferHistoryItem, 0)
+	for rows.Next() {
+		var item domain.TransferHistoryItem
+		item.Status = "completed"
+		if err := rows.Scan(&item.ID, &item.SourceWalletID, &item.DestinationWalletID,
+			&item.Amount, &item.Currency, &item.CreatedAt); err != nil {
+			return nil, 0, translateError("scan transfer history", err)
+		}
+		items = append(items, item)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, 0, translateError("iterate transfer history", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, 0, translateError("commit transfer history transaction", err)
+	}
+	return items, total, nil
+}
+
+func (r *TransferRepository) Count(ctx context.Context, userID uuid.UUID, filter domain.TransferHistoryFilter) (int64, error) {
+	where, args := transferHistoryWhere(userID, filter)
+	return countTransferHistory(ctx, r.pool, where, args)
+}
+
+type transferHistoryQuery interface {
+	QueryRow(context.Context, string, ...any) pgx.Row
+}
+
+func countTransferHistory(ctx context.Context, query transferHistoryQuery, where string, args []any) (int64, error) {
+	var total int64
+	if err := query.QueryRow(ctx, `SELECT count(*) FROM ledger_transactions lt `+where, args...).Scan(&total); err != nil {
+		return 0, translateError("count transfer history", err)
+	}
+	return total, nil
+}
+
+func transferHistoryWhere(userID uuid.UUID, filter domain.TransferHistoryFilter) (string, []any) {
+	conditions := []string{
+		"lt.transaction_type = 'transfer'",
+		"(EXISTS (SELECT 1 FROM wallets sw WHERE sw.id = lt.wallet_id AND sw.user_id = $1) OR EXISTS (SELECT 1 FROM wallets dw WHERE dw.id = lt.destination_wallet_id AND dw.user_id = $1))",
+	}
+	args := []any{userID}
+	if filter.Direction == "outgoing" {
+		conditions = append(conditions, "EXISTS (SELECT 1 FROM wallets sw WHERE sw.id = lt.wallet_id AND sw.user_id = $1)")
+	} else if filter.Direction == "incoming" {
+		conditions = append(conditions, "EXISTS (SELECT 1 FROM wallets dw WHERE dw.id = lt.destination_wallet_id AND dw.user_id = $1)")
+	}
+	if filter.Currency != "" {
+		args = append(args, filter.Currency)
+		conditions = append(conditions, fmt.Sprintf("lt.currency = $%d", len(args)))
+	}
+	return "WHERE " + strings.Join(conditions, " AND "), args
 }
 
 func (r *TransferRepository) Create(ctx context.Context, userID, sourceID, destinationID uuid.UUID, amount int64, currency, key string, requestHash []byte) (result domain.Transfer, replay bool, returnedErr error) {
