@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"crypto/subtle"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"io"
 	"strconv"
@@ -12,6 +13,10 @@ import (
 
 	"golang.org/x/crypto/argon2"
 )
+
+// errInvalidPasswordHash means the stored hash cannot be parsed, which points at
+// a corrupted row rather than at the submitted password.
+var errInvalidPasswordHash = errors.New("invalid stored password hash")
 
 const (
 	argonTime        uint32 = 3
@@ -58,53 +63,67 @@ type argonParameters struct {
 	threads uint8
 }
 
+// parsePasswordHash reads the PHC string written by HashPassword. Every field is
+// range-checked before it is used, because the value comes from the database.
 func parsePasswordHash(encoded string) (argonParameters, []byte, []byte, error) {
 	parts := strings.Split(encoded, "$")
 	if len(parts) != 6 || parts[0] != "" || parts[1] != "argon2id" {
-		return argonParameters{}, nil, nil, errorsInvalidPasswordHash()
+		return argonParameters{}, nil, nil, errInvalidPasswordHash
 	}
 
 	version, err := strconv.ParseUint(strings.TrimPrefix(parts[2], "v="), 10, 32)
 	if err != nil || version != uint64(argon2.Version) {
-		return argonParameters{}, nil, nil, errorsInvalidPasswordHash()
+		return argonParameters{}, nil, nil, errInvalidPasswordHash
 	}
+
 	params, err := parseArgonParameters(parts[3])
 	if err != nil {
-		return argonParameters{}, nil, nil, errorsInvalidPasswordHash()
+		return argonParameters{}, nil, nil, errInvalidPasswordHash
 	}
+
 	salt, err := base64.RawStdEncoding.DecodeString(parts[4])
 	if err != nil || len(salt) < 16 || len(salt) > 64 {
-		return argonParameters{}, nil, nil, errorsInvalidPasswordHash()
+		return argonParameters{}, nil, nil, errInvalidPasswordHash
 	}
+
 	expected, err := base64.RawStdEncoding.DecodeString(parts[5])
 	if err != nil || len(expected) < 16 || len(expected) > 64 {
-		return argonParameters{}, nil, nil, errorsInvalidPasswordHash()
+		return argonParameters{}, nil, nil, errInvalidPasswordHash
 	}
+
 	return params, salt, expected, nil
 }
 
 func parseArgonParameters(encoded string) (argonParameters, error) {
 	var params argonParameters
+
 	values := make(map[string]uint64, 3)
 	for _, part := range strings.Split(encoded, ",") {
 		key, value, ok := strings.Cut(part, "=")
 		if !ok {
-			return argonParameters{}, errorsInvalidPasswordHash()
+			return argonParameters{}, errInvalidPasswordHash
 		}
+
 		parsed, err := strconv.ParseUint(value, 10, 32)
 		if err != nil {
-			return argonParameters{}, errorsInvalidPasswordHash()
+			return argonParameters{}, errInvalidPasswordHash
 		}
 		if _, exists := values[key]; exists {
-			return argonParameters{}, errorsInvalidPasswordHash()
+			return argonParameters{}, errInvalidPasswordHash
 		}
+
 		values[key] = parsed
 	}
+
 	// Bounds stop a corrupted or hostile stored hash from asking for gigabytes of
 	// memory the next time somebody logs in.
-	if len(values) != 3 || values["m"] < 8*1024 || values["m"] > 256*1024 || values["t"] < 1 || values["t"] > 10 || values["p"] < 1 || values["p"] > 8 {
-		return argonParameters{}, errorsInvalidPasswordHash()
+	if len(values) != 3 ||
+		values["m"] < 8*1024 || values["m"] > 256*1024 ||
+		values["t"] < 1 || values["t"] > 10 ||
+		values["p"] < 1 || values["p"] > 8 {
+		return argonParameters{}, errInvalidPasswordHash
 	}
+
 	params.memory = uint32(values["m"])
 	params.time = uint32(values["t"])
 	params.threads = uint8(values["p"])
@@ -113,8 +132,4 @@ func parseArgonParameters(encoded string) (argonParameters, error) {
 
 func validPasswordLength(password string) bool {
 	return utf8.ValidString(password) && len(password) <= maxPasswordBytes && utf8.RuneCountInString(password) >= minPasswordRunes
-}
-
-func errorsInvalidPasswordHash() error {
-	return fmt.Errorf("invalid stored password hash")
 }

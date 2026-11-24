@@ -6,12 +6,12 @@ import (
 	"fmt"
 	"net/mail"
 	"strings"
-	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/Mopcs/mini-payment-system/internal/dbutil"
 	"github.com/Mopcs/mini-payment-system/internal/domain"
 	"github.com/Mopcs/mini-payment-system/internal/repository/postgres"
 )
@@ -46,6 +46,7 @@ func (s *Service) Register(ctx context.Context, email, password string) (result 
 	if !validPasswordLength(password) {
 		return Result{}, ErrInvalidPassword
 	}
+
 	passwordHash, err := HashPassword(password)
 	if err != nil {
 		return Result{}, fmt.Errorf("hash registration password: %w", err)
@@ -54,39 +55,39 @@ func (s *Service) Register(ctx context.Context, email, password string) (result 
 	// User and first wallet go in together. A half-registered account would leave
 	// someone who can log in but has nowhere to deposit.
 	user := &domain.User{ID: uuid.New(), Email: normalizedEmail, PasswordHash: passwordHash}
+
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return Result{}, fmt.Errorf("begin registration transaction: %w", err)
 	}
-	committed := false
-	defer func() {
-		if committed {
-			return
-		}
-		rollbackCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
-		defer cancel()
-		if rollbackErr := tx.Rollback(rollbackCtx); rollbackErr != nil && !errors.Is(rollbackErr, pgx.ErrTxClosed) {
-			returnedErr = errors.Join(returnedErr, fmt.Errorf("rollback registration transaction: %w", rollbackErr))
-		}
-	}()
+	defer dbutil.Rollback(ctx, tx, &returnedErr)
 
-	userRepo := postgres.NewUserRepository(tx)
-	if err := userRepo.Create(ctx, user); err != nil {
-		if errors.Is(err, postgres.ErrEmailAlreadyExists) {
-			return Result{}, ErrEmailAlreadyRegistered
-		}
-		return Result{}, fmt.Errorf("create registration user: %w", err)
+	if err := createUserWithWallet(ctx, tx, user); err != nil {
+		return Result{}, err
 	}
-	wallet := &domain.Wallet{ID: uuid.New(), UserID: user.ID, Currency: "USD", Balance: 0}
-	if err := postgres.NewWalletRepository(tx).Create(ctx, wallet); err != nil {
-		return Result{}, fmt.Errorf("create initial wallet: %w", err)
-	}
+
 	if err := tx.Commit(ctx); err != nil {
 		return Result{}, fmt.Errorf("commit registration transaction: %w", err)
 	}
-	committed = true
 
 	return s.issueResult(user)
+}
+
+// createUserWithWallet inserts the account and its default wallet inside the
+// caller's transaction.
+func createUserWithWallet(ctx context.Context, tx pgx.Tx, user *domain.User) error {
+	if err := postgres.NewUserRepository(tx).Create(ctx, user); err != nil {
+		if errors.Is(err, postgres.ErrEmailAlreadyExists) {
+			return ErrEmailAlreadyRegistered
+		}
+		return fmt.Errorf("create registration user: %w", err)
+	}
+
+	wallet := &domain.Wallet{ID: uuid.New(), UserID: user.ID, Currency: domain.USD, Balance: 0}
+	if err := postgres.NewWalletRepository(tx).Create(ctx, wallet); err != nil {
+		return fmt.Errorf("create initial wallet: %w", err)
+	}
+	return nil
 }
 
 func (s *Service) Login(ctx context.Context, email, password string) (Result, error) {

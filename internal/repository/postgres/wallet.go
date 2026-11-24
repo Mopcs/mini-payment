@@ -2,7 +2,6 @@ package postgres
 
 import (
 	"context"
-	"strings"
 
 	"github.com/google/uuid"
 
@@ -24,7 +23,7 @@ func (r *WalletRepository) Create(ctx context.Context, wallet *domain.Wallet) er
 	if wallet.ID == uuid.Nil {
 		wallet.ID = uuid.New()
 	}
-	wallet.Currency = normalizeCurrency(wallet.Currency)
+	wallet.Currency = domain.NormalizeCurrency(wallet.Currency)
 
 	err := r.db.QueryRow(ctx, `
 		INSERT INTO wallets (id, user_id, currency, balance)
@@ -91,14 +90,10 @@ func (r *WalletRepository) GetByUserIDAndCurrency(ctx context.Context, userID uu
 	err := r.db.QueryRow(ctx, `
 		SELECT id, user_id, currency, balance, created_at, updated_at
 		FROM wallets
-		WHERE user_id = $1 AND currency = $2`, userID, normalizeCurrency(currency),
+		WHERE user_id = $1 AND currency = $2`, userID, domain.NormalizeCurrency(currency),
 	).Scan(&wallet.ID, &wallet.UserID, &wallet.Currency, &wallet.Balance, &wallet.CreatedAt, &wallet.UpdatedAt)
 	if err != nil {
 		return nil, translateError("get wallet by user and currency", err)
 	}
 	return wallet, nil
-}
-
-func normalizeCurrency(currency string) string {
-	return strings.ToUpper(strings.TrimSpace(currency))
 }

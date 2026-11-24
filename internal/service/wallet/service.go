@@ -56,12 +56,11 @@ func (s *Service) Get(ctx context.Context, userID, walletID uuid.UUID) (*domain.
 }
 
 func (s *Service) Create(ctx context.Context, userID uuid.UUID, currency string) (*domain.Wallet, error) {
-	currency = strings.ToUpper(strings.TrimSpace(currency))
-	switch currency {
-	case "USD", "EUR", "JPY":
-	default:
+	currency = domain.NormalizeCurrency(currency)
+	if !domain.IsSupportedCurrency(currency) {
 		return nil, ErrInvalidCurrency
 	}
+
 	wallet := &domain.Wallet{ID: uuid.New(), UserID: userID, Currency: currency, Balance: 0}
 	if err := s.repository.Create(ctx, wallet); err != nil {
 		if errors.Is(err, postgres.ErrWalletAlreadyExists) {
@@ -76,12 +75,12 @@ func (s *Service) Deposit(ctx context.Context, userID, walletID uuid.UUID, amoun
 	if amount <= 0 {
 		return domain.Deposit{}, false, ErrInvalidAmount
 	}
-	currency = strings.ToUpper(strings.TrimSpace(currency))
-	switch currency {
-	case "USD", "EUR", "JPY":
-	default:
+
+	currency = domain.NormalizeCurrency(currency)
+	if !domain.IsSupportedCurrency(currency) {
 		return domain.Deposit{}, false, ErrInvalidCurrency
 	}
+
 	idempotencyKey = strings.TrimSpace(idempotencyKey)
 	if len(idempotencyKey) == 0 || len(idempotencyKey) > 128 {
 		return domain.Deposit{}, false, ErrInvalidIdempotencyKey

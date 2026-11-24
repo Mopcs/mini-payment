@@ -10,6 +10,8 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
+
 	"github.com/Mopcs/mini-payment-system/internal/config"
 	"github.com/Mopcs/mini-payment-system/internal/infrastructure/postgres"
 	"github.com/Mopcs/mini-payment-system/internal/worker/outbox"
@@ -37,12 +39,10 @@ func run(cfg config.Config, logger *slog.Logger) error {
 		return fmt.Errorf("create PostgreSQL pool: %w", err)
 	}
 	defer pool.Close()
-	pingCtx, cancelPing := context.WithTimeout(ctx, 5*time.Second)
-	if err := pool.Ping(pingCtx); err != nil {
-		cancelPing()
+
+	if err := pingPool(ctx, pool); err != nil {
 		return fmt.Errorf("connect to PostgreSQL: %w", err)
 	}
-	cancelPing()
 
 	settings := outbox.Settings{
 		BatchSize:     cfg.OutboxBatchSize,
@@ -65,6 +65,12 @@ func run(cfg config.Config, logger *slog.Logger) error {
 		return fmt.Errorf("run outbox worker: %w", err)
 	}
 	return nil
+}
+
+func pingPool(ctx context.Context, pool *pgxpool.Pool) error {
+	pingCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	return pool.Ping(pingCtx)
 }
 
 func newLogger(levelName string) *slog.Logger {

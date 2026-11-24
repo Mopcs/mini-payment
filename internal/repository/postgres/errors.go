@@ -29,6 +29,7 @@ var (
 	ErrTransferSourceNotOwned   = errors.New("source wallet is not owned by user")
 	ErrTransferCurrencyMismatch = errors.New("transfer wallet currency mismatch")
 	ErrInsufficientFunds        = errors.New("insufficient wallet funds")
+	ErrWalletBalanceChanged     = errors.New("wallet balance changed while the transaction was in flight")
 )
 
 type databaseOperationError struct {
@@ -59,33 +60,40 @@ func translateError(operation string, err error) error {
 		return &databaseOperationError{operation: operation, cause: err}
 	}
 
-	var kind error
-	switch pgErr.Code {
-	case "23505":
-		switch pgErr.ConstraintName {
-		case "users_email_lower_unique_idx":
-			kind = ErrEmailAlreadyExists
-		case "wallets_user_currency_unique":
-			kind = ErrWalletAlreadyExists
-		default:
-			kind = ErrUniqueViolation
-		}
-	case "23503":
-		kind = ErrForeignKeyViolation
-	case "23514":
-		switch pgErr.ConstraintName {
-		case "users_email_normalized_check":
-			kind = ErrInvalidEmail
-		case "wallets_balance_nonnegative_check":
-			kind = ErrInvalidBalance
-		case "wallets_currency_check":
-			kind = ErrUnsupportedCurrency
-		default:
-			kind = ErrCheckViolation
-		}
-	default:
+	kind, known := translateSQLState(pgErr)
+	if !known {
 		return &databaseOperationError{operation: operation, cause: err}
 	}
-
 	return fmt.Errorf("%s: %w", operation, kind)
+}
+
+// translateSQLState maps the SQLSTATE codes we care about. Where a code is too
+// broad, the constraint name picks the specific sentinel.
+func translateSQLState(pgErr *pgconn.PgError) (error, bool) {
+	switch pgErr.Code {
+	case "23505": // unique violation
+		switch pgErr.ConstraintName {
+		case "users_email_lower_unique_idx":
+			return ErrEmailAlreadyExists, true
+		case "wallets_user_currency_unique":
+			return ErrWalletAlreadyExists, true
+		default:
+			return ErrUniqueViolation, true
+		}
+	case "23503": // foreign key violation
+		return ErrForeignKeyViolation, true
+	case "23514": // check violation
+		switch pgErr.ConstraintName {
+		case "users_email_normalized_check":
+			return ErrInvalidEmail, true
+		case "wallets_balance_nonnegative_check":
+			return ErrInvalidBalance, true
+		case "wallets_currency_check":
+			return ErrUnsupportedCurrency, true
+		default:
+			return ErrCheckViolation, true
+		}
+	default:
+		return nil, false
+	}
 }

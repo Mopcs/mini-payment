@@ -36,7 +36,10 @@ type Worker struct {
 }
 
 func New(pool *pgxpool.Pool, settings Settings, factory PublisherFactory, logger *slog.Logger) (*Worker, error) {
-	if settings.BatchSize < 1 || settings.BatchSize > 1000 || settings.PollInterval.Microseconds() < 1 || settings.LeaseDuration.Microseconds() < 1 || settings.MaxBackoff.Microseconds() < 1 {
+	if settings.BatchSize < 1 || settings.BatchSize > 1000 ||
+		settings.PollInterval.Microseconds() < 1 ||
+		settings.LeaseDuration.Microseconds() < 1 ||
+		settings.MaxBackoff.Microseconds() < 1 {
 		return nil, errors.New("outbox worker settings must be positive")
 	}
 	if factory == nil {
@@ -45,6 +48,7 @@ func New(pool *pgxpool.Pool, settings Settings, factory PublisherFactory, logger
 	if logger == nil {
 		logger = slog.Default()
 	}
+
 	return &Worker{
 		repository: postgres.NewOutboxRepository(pool),
 		settings:   settings,
@@ -54,12 +58,15 @@ func New(pool *pgxpool.Pool, settings Settings, factory PublisherFactory, logger
 	}, nil
 }
 
+// Run polls the outbox until the context is cancelled. A dead RabbitMQ
+// connection is not fatal: the worker drops it and reconnects on the next tick.
 func (w *Worker) Run(ctx context.Context) error {
 	w.logger.Info("outbox worker started", slog.String("worker_id", w.workerID.String()))
 	defer w.logger.Info("outbox worker stopped", slog.String("worker_id", w.workerID.String()))
 
 	ticker := time.NewTicker(w.settings.PollInterval)
 	defer ticker.Stop()
+
 	var publisher Publisher
 	defer func() {
 		if publisher != nil {
@@ -69,73 +76,113 @@ func (w *Worker) Run(ctx context.Context) error {
 		}
 	}()
 
-	for {
-		if err := ctx.Err(); err != nil {
-			return nil
-		}
+	for ctx.Err() == nil {
 		if publisher == nil {
-			connected, err := w.factory(ctx)
-			if err != nil || connected == nil {
-				w.logger.Warn("RabbitMQ connection unavailable; will retry", slog.String("worker_id", w.workerID.String()))
-			} else {
-				publisher = connected
-				w.logger.Info("RabbitMQ connected", slog.String("worker_id", w.workerID.String()))
-			}
+			publisher = w.connect(ctx)
 		}
+
 		if publisher != nil && w.processBatch(ctx, publisher) {
-			if err := publisher.Close(); err != nil {
-				w.logger.Warn("close RabbitMQ publisher after publish failure", slog.Any("error", err))
-			}
+			w.disconnect(publisher)
 			publisher = nil
-			w.logger.Warn("RabbitMQ publisher will reconnect", slog.String("worker_id", w.workerID.String()))
 		}
+
 		select {
 		case <-ctx.Done():
 			return nil
 		case <-ticker.C:
 		}
 	}
+	return nil
 }
 
-func (w *Worker) processBatch(ctx context.Context, publisher Publisher) bool {
+// connect opens a publisher, or returns nil when the broker is not reachable
+// yet. The caller simply tries again on the next tick.
+func (w *Worker) connect(ctx context.Context) Publisher {
+	publisher, err := w.factory(ctx)
+	if err != nil || publisher == nil {
+		w.logger.Warn("RabbitMQ connection unavailable; will retry", slog.String("worker_id", w.workerID.String()))
+		return nil
+	}
+	w.logger.Info("RabbitMQ connected", slog.String("worker_id", w.workerID.String()))
+	return publisher
+}
+
+func (w *Worker) disconnect(publisher Publisher) {
+	if err := publisher.Close(); err != nil {
+		w.logger.Warn("close RabbitMQ publisher after publish failure", slog.Any("error", err))
+	}
+	w.logger.Warn("RabbitMQ publisher will reconnect", slog.String("worker_id", w.workerID.String()))
+}
+
+// processBatch publishes one claimed batch and reports whether the connection
+// looks broken.
+func (w *Worker) processBatch(ctx context.Context, publisher Publisher) (reconnect bool) {
 	events, err := w.repository.ClaimBatch(ctx, w.workerID, w.settings.BatchSize, w.settings.LeaseDuration)
 	if err != nil {
 		w.logger.Error("claim outbox events failed", slog.Any("error", err))
 		return false
 	}
+
 	w.logger.Info("claimed outbox events", slog.Int("count", len(events)), slog.String("worker_id", w.workerID.String()))
-	connectionFailed := false // a publish error usually means the channel is gone
+
 	for _, event := range events {
-		// Top up the lease first, publishing can outlast what is left of it.
-		if err := w.repository.ExtendLease(ctx, event.ID, w.workerID, w.settings.LeaseDuration); err != nil {
-			w.logger.Warn("outbox event lease is no longer owned", slog.String("event_id", event.ID.String()))
-			continue
+		if w.publishEvent(ctx, publisher, event) {
+			reconnect = true
 		}
-		publishTimeout := w.settings.LeaseDuration / 2
-		if publishTimeout < time.Microsecond {
-			publishTimeout = w.settings.LeaseDuration
-		}
-		publishCtx, cancelPublish := context.WithTimeout(ctx, publishTimeout)
-		publishErr := publisher.Publish(publishCtx, event)
-		cancelPublish()
-		if publishErr != nil {
-			connectionFailed = true
-			delay := RetryDelay(event.Attempts+1, w.settings.MaxBackoff)
-			if retryErr := w.repository.ScheduleRetry(ctx, event.ID, w.workerID, publishErr.Error(), delay); retryErr != nil {
-				w.logger.Error("schedule outbox retry failed", slog.String("event_id", event.ID.String()), slog.Any("error", retryErr))
-				continue
-			}
-			w.logger.Warn("outbox event publication failed", slog.String("event_id", event.ID.String()),
-				slog.Int("attempt", event.Attempts+1), slog.Duration("retry_after", delay))
-			continue
-		}
-		if err := w.repository.MarkPublished(ctx, event.ID, w.workerID); err != nil {
-			w.logger.Error("mark outbox event published failed", slog.String("event_id", event.ID.String()), slog.Any("error", err))
-			continue
-		}
-		w.logger.Info("outbox event published", slog.String("event_id", event.ID.String()), slog.String("event_type", event.EventType))
 	}
-	return connectionFailed
+	return reconnect
+}
+
+// publishEvent publishes a single event and reports whether the failure looks
+// like a broken channel. Lease and bookkeeping errors are local, so they do not
+// ask for a reconnect.
+func (w *Worker) publishEvent(ctx context.Context, publisher Publisher, event domain.OutboxEvent) (connectionFailed bool) {
+	// Top up the lease first, publishing can outlast what is left of it.
+	if err := w.repository.ExtendLease(ctx, event.ID, w.workerID, w.settings.LeaseDuration); err != nil {
+		w.logger.Warn("outbox event lease is no longer owned", slog.String("event_id", event.ID.String()))
+		return false
+	}
+
+	publishCtx, cancel := context.WithTimeout(ctx, w.publishTimeout())
+	err := publisher.Publish(publishCtx, event)
+	cancel()
+
+	if err != nil {
+		delay := RetryDelay(event.Attempts+1, w.settings.MaxBackoff)
+		if retryErr := w.repository.ScheduleRetry(ctx, event.ID, w.workerID, err.Error(), delay); retryErr != nil {
+			w.logger.Error("schedule outbox retry failed",
+				slog.String("event_id", event.ID.String()),
+				slog.Any("error", retryErr))
+			return true
+		}
+		w.logger.Warn("outbox event publication failed",
+			slog.String("event_id", event.ID.String()),
+			slog.Int("attempt", event.Attempts+1),
+			slog.Duration("retry_after", delay))
+		return true
+	}
+
+	if err := w.repository.MarkPublished(ctx, event.ID, w.workerID); err != nil {
+		w.logger.Error("mark outbox event published failed",
+			slog.String("event_id", event.ID.String()),
+			slog.Any("error", err))
+		return false
+	}
+
+	w.logger.Info("outbox event published",
+		slog.String("event_id", event.ID.String()),
+		slog.String("event_type", event.EventType))
+	return false
+}
+
+// publishTimeout keeps a single publish inside the lease, so the worker still
+// owns the event when the broker answers.
+func (w *Worker) publishTimeout() time.Duration {
+	timeout := w.settings.LeaseDuration / 2
+	if timeout < time.Microsecond {
+		return w.settings.LeaseDuration
+	}
+	return timeout
 }
 
 // RetryDelay doubles the wait starting at one second, capped at maximum.

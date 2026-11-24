@@ -22,15 +22,7 @@ import (
 
 func main() {
 	cfg, err := config.Load()
-	level := slog.LevelInfo
-	if cfg.LogLevel == "debug" {
-		level = slog.LevelDebug
-	} else if cfg.LogLevel == "warn" {
-		level = slog.LevelWarn
-	} else if cfg.LogLevel == "error" {
-		level = slog.LevelError
-	}
-	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: level}))
+	logger := newLogger(cfg.LogLevel)
 	if err != nil {
 		logger.Error("load configuration", slog.Any("error", err))
 		os.Exit(1)
@@ -39,6 +31,21 @@ func main() {
 		logger.Error("application stopped with error", slog.Any("error", err))
 		os.Exit(1)
 	}
+}
+
+// newLogger builds the JSON logger every command uses. An unknown level falls
+// back to info, which config.Load has already rejected by this point.
+func newLogger(levelName string) *slog.Logger {
+	level := slog.LevelInfo
+	switch levelName {
+	case "debug":
+		level = slog.LevelDebug
+	case "warn":
+		level = slog.LevelWarn
+	case "error":
+		level = slog.LevelError
+	}
+	return slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: level}))
 }
 
 func run(cfg config.Config, logger *slog.Logger) error {

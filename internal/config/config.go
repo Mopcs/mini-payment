@@ -12,6 +12,12 @@ import (
 	"github.com/joho/godotenv"
 )
 
+const (
+	minJWTSecretBytes = 32
+	maxJWTTTL         = 24 * time.Hour
+	maxQueueTTL       = int64(^uint32(0) >> 1)
+)
+
 type Config struct {
 	AppAddr                      string
 	PostgresHost                 string
@@ -52,129 +58,186 @@ func Load() (Config, error) {
 		return Config{}, errors.New("load .env: file could not be parsed")
 	}
 
+	// Defaults first, so each loader below only overwrites what it validates.
+	cfg := Config{
+		AppAddr:      envOrDefault("APP_ADDR", ":8080"),
+		PostgresHost: envOrDefault("POSTGRES_HOST", "localhost"),
+		PostgresDB:   envOrDefault("POSTGRES_DB", "payment_db"),
+		PostgresUser: envOrDefault("POSTGRES_USER", "payment_user"),
+		RedisHost:    envOrDefault("REDIS_HOST", "localhost"),
+		LogLevel:     envOrDefault("LOG_LEVEL", "info"),
+		JWTIssuer:    strings.TrimSpace(envOrDefault("JWT_ISSUER", "mini-payment-system")),
+	}
+
+	loaders := []func(*Config) error{
+		loadConnections,
+		loadLogging,
+		loadAuth,
+		loadBroker,
+		loadOutbox,
+		loadConsumer,
+	}
+	for _, load := range loaders {
+		if err := load(&cfg); err != nil {
+			return Config{}, err
+		}
+	}
+
+	return cfg, nil
+}
+
+// loadConnections validates the PostgreSQL and Redis endpoints.
+func loadConnections(cfg *Config) error {
 	postgresPort, err := portFromEnv("POSTGRES_PORT", "5432")
 	if err != nil {
-		return Config{}, err
+		return err
 	}
 	redisPort, err := portFromEnv("REDIS_PORT", "6379")
 	if err != nil {
-		return Config{}, err
+		return err
 	}
 
 	postgresPassword, err := requiredEnv("POSTGRES_PASSWORD")
 	if err != nil {
-		return Config{}, err
+		return err
 	}
 	redisPassword, err := requiredEnv("REDIS_PASSWORD")
 	if err != nil {
-		return Config{}, err
+		return err
 	}
 
-	logLevel := envOrDefault("LOG_LEVEL", "info")
-	if logLevel != "debug" && logLevel != "info" && logLevel != "warn" && logLevel != "error" {
-		return Config{}, fmt.Errorf("LOG_LEVEL must be debug, info, warn, or error")
+	cfg.PostgresPort = postgresPort
+	cfg.PostgresPass = postgresPassword
+	cfg.RedisPort = redisPort
+	cfg.RedisPassword = redisPassword
+	return nil
+}
+
+func loadLogging(cfg *Config) error {
+	switch cfg.LogLevel {
+	case "debug", "info", "warn", "error":
+		return nil
+	default:
+		return errors.New("LOG_LEVEL must be debug, info, warn, or error")
 	}
-	jwtSecret, err := requiredEnv("JWT_SECRET")
+}
+
+func loadAuth(cfg *Config) error {
+	secret, err := requiredEnv("JWT_SECRET")
 	if err != nil {
-		return Config{}, err
+		return err
 	}
-	if len([]byte(jwtSecret)) < 32 {
-		return Config{}, errors.New("JWT_SECRET must be at least 32 bytes")
+	if len([]byte(secret)) < minJWTSecretBytes {
+		return errors.New("JWT_SECRET must be at least 32 bytes")
 	}
-	jwtIssuer := strings.TrimSpace(envOrDefault("JWT_ISSUER", "mini-payment-system"))
-	if jwtIssuer == "" {
-		return Config{}, errors.New("JWT_ISSUER must not be empty")
+	if cfg.JWTIssuer == "" {
+		return errors.New("JWT_ISSUER must not be empty")
 	}
-	jwtTTL, err := time.ParseDuration(envOrDefault("JWT_ACCESS_TOKEN_TTL", "15m"))
-	if err != nil || jwtTTL < time.Second || jwtTTL > 24*time.Hour {
-		return Config{}, errors.New("JWT_ACCESS_TOKEN_TTL must be between 1s and 24h")
+
+	ttl, err := time.ParseDuration(envOrDefault("JWT_ACCESS_TOKEN_TTL", "15m"))
+	if err != nil || ttl < time.Second || ttl > maxJWTTTL {
+		return errors.New("JWT_ACCESS_TOKEN_TTL must be between 1s and 24h")
 	}
-	rabbitUser := envOrDefault("RABBITMQ_USER", "payment_user")
-	rabbitPassword := envOrDefault("RABBITMQ_PASSWORD", "local_dev_rabbitmq_password")
-	defaultRabbitURL := "amqp://" + url.UserPassword(rabbitUser, rabbitPassword).String() + "@localhost:5672/"
-	rabbitURL := strings.TrimSpace(envOrDefault("RABBITMQ_URL", defaultRabbitURL))
-	if rabbitURL != "" {
-		parsedURL, err := url.Parse(rabbitURL)
-		if err != nil || (parsedURL.Scheme != "amqp" && parsedURL.Scheme != "amqps") || parsedURL.Host == "" {
-			return Config{}, errors.New("RABBITMQ_URL must be a valid amqp or amqps URL")
-		}
+
+	cfg.JWTSecret = secret
+	cfg.JWTAccessTokenTTL = ttl
+	return nil
+}
+
+// loadBroker reads the RabbitMQ connection, topology names and retry policy.
+func loadBroker(cfg *Config) error {
+	brokerURL, err := rabbitURL()
+	if err != nil {
+		return err
 	}
+
+	retryDelay, err := durationFromEnv("RABBITMQ_RETRY_DELAY", 5*time.Second)
+	if err != nil || retryDelay < time.Millisecond || retryDelay.Milliseconds() > maxQueueTTL {
+		return errors.New("RABBITMQ_RETRY_DELAY must be between 1ms and the supported queue TTL limit")
+	}
+
+	cfg.RabbitMQURL = brokerURL
+	cfg.RabbitMQExchange = strings.TrimSpace(envOrDefault("RABBITMQ_EXCHANGE", "payment.events"))
+	cfg.RabbitMQQueue = strings.TrimSpace(envOrDefault("RABBITMQ_QUEUE", "payment.events"))
+	cfg.RabbitMQRoutingKey = strings.TrimSpace(envOrDefault("RABBITMQ_ROUTING_KEY", "transfer.completed"))
+	cfg.RabbitMQRetryExchange = strings.TrimSpace(envOrDefault("RABBITMQ_RETRY_EXCHANGE", "payment.events.retry"))
+	cfg.RabbitMQRetryQueue = strings.TrimSpace(envOrDefault("RABBITMQ_RETRY_QUEUE", "payment.events.retry"))
+	cfg.RabbitMQDeadLetterExchange = strings.TrimSpace(envOrDefault("RABBITMQ_DEAD_LETTER_EXCHANGE", "payment.events.dlx"))
+	cfg.RabbitMQDeadLetterQueue = strings.TrimSpace(envOrDefault("RABBITMQ_DEAD_LETTER_QUEUE", "payment.events.dlq"))
+	cfg.RabbitMQDeadLetterRoutingKey = strings.TrimSpace(envOrDefault("RABBITMQ_DEAD_LETTER_ROUTING_KEY", "transfer.completed.dlq"))
+	cfg.RabbitMQRetryDelay = retryDelay
+
+	if cfg.RabbitMQExchange == "" || cfg.RabbitMQQueue == "" || cfg.RabbitMQRoutingKey == "" ||
+		cfg.RabbitMQRetryExchange == "" || cfg.RabbitMQRetryQueue == "" ||
+		cfg.RabbitMQDeadLetterExchange == "" || cfg.RabbitMQDeadLetterQueue == "" ||
+		cfg.RabbitMQDeadLetterRoutingKey == "" {
+		return errors.New("RabbitMQ exchange, queue, and routing key settings must not be empty")
+	}
+	return nil
+}
+
+// rabbitURL builds the local development URL from the user and password when
+// RABBITMQ_URL is not set explicitly.
+func rabbitURL() (string, error) {
+	user := envOrDefault("RABBITMQ_USER", "payment_user")
+	password := envOrDefault("RABBITMQ_PASSWORD", "local_dev_rabbitmq_password")
+	defaultURL := "amqp://" + url.UserPassword(user, password).String() + "@localhost:5672/"
+
+	brokerURL := strings.TrimSpace(envOrDefault("RABBITMQ_URL", defaultURL))
+	if brokerURL == "" {
+		return "", nil
+	}
+
+	parsed, err := url.Parse(brokerURL)
+	if err != nil || (parsed.Scheme != "amqp" && parsed.Scheme != "amqps") || parsed.Host == "" {
+		return "", errors.New("RABBITMQ_URL must be a valid amqp or amqps URL")
+	}
+	return brokerURL, nil
+}
+
+func loadOutbox(cfg *Config) error {
 	batchSize, err := intFromEnv("OUTBOX_BATCH_SIZE", 20, 1, 1000)
 	if err != nil {
-		return Config{}, err
+		return err
 	}
 	pollInterval, err := durationFromEnv("OUTBOX_POLL_INTERVAL", time.Second)
 	if err != nil {
-		return Config{}, err
+		return err
 	}
 	leaseDuration, err := durationFromEnv("OUTBOX_LEASE_DURATION", 30*time.Second)
 	if err != nil {
-		return Config{}, err
+		return err
 	}
 	maxBackoff, err := durationFromEnv("OUTBOX_MAX_BACKOFF", 5*time.Minute)
 	if err != nil {
-		return Config{}, err
-	}
-	retryDelay, err := durationFromEnv("RABBITMQ_RETRY_DELAY", 5*time.Second)
-	if err != nil || retryDelay < time.Millisecond || retryDelay.Milliseconds() > int64(^uint32(0)>>1) {
-		return Config{}, errors.New("RABBITMQ_RETRY_DELAY must be between 1ms and the supported queue TTL limit")
-	}
-	consumerMaxRetries, err := intFromEnv("CONSUMER_MAX_RETRIES", 5, 0, 100)
-	if err != nil {
-		return Config{}, err
-	}
-	consumerPrefetch, err := intFromEnv("CONSUMER_PREFETCH_COUNT", 10, 1, 1000)
-	if err != nil {
-		return Config{}, err
-	}
-	consumerReconnect, err := durationFromEnv("CONSUMER_RECONNECT_INTERVAL", time.Second)
-	if err != nil {
-		return Config{}, err
-	}
-	rabbitExchange := strings.TrimSpace(envOrDefault("RABBITMQ_EXCHANGE", "payment.events"))
-	rabbitQueue := strings.TrimSpace(envOrDefault("RABBITMQ_QUEUE", "payment.events"))
-	rabbitRoutingKey := strings.TrimSpace(envOrDefault("RABBITMQ_ROUTING_KEY", "transfer.completed"))
-	retryExchange := strings.TrimSpace(envOrDefault("RABBITMQ_RETRY_EXCHANGE", "payment.events.retry"))
-	retryQueue := strings.TrimSpace(envOrDefault("RABBITMQ_RETRY_QUEUE", "payment.events.retry"))
-	deadLetterExchange := strings.TrimSpace(envOrDefault("RABBITMQ_DEAD_LETTER_EXCHANGE", "payment.events.dlx"))
-	deadLetterQueue := strings.TrimSpace(envOrDefault("RABBITMQ_DEAD_LETTER_QUEUE", "payment.events.dlq"))
-	deadLetterRoutingKey := strings.TrimSpace(envOrDefault("RABBITMQ_DEAD_LETTER_ROUTING_KEY", "transfer.completed.dlq"))
-	if rabbitExchange == "" || rabbitQueue == "" || rabbitRoutingKey == "" || retryExchange == "" || retryQueue == "" || deadLetterExchange == "" || deadLetterQueue == "" || deadLetterRoutingKey == "" {
-		return Config{}, errors.New("RabbitMQ exchange, queue, and routing key settings must not be empty")
+		return err
 	}
 
-	return Config{
-		AppAddr:                      envOrDefault("APP_ADDR", ":8080"),
-		PostgresHost:                 envOrDefault("POSTGRES_HOST", "localhost"),
-		PostgresPort:                 postgresPort,
-		PostgresDB:                   envOrDefault("POSTGRES_DB", "payment_db"),
-		PostgresUser:                 envOrDefault("POSTGRES_USER", "payment_user"),
-		PostgresPass:                 postgresPassword,
-		RedisHost:                    envOrDefault("REDIS_HOST", "localhost"),
-		RedisPort:                    redisPort,
-		RedisPassword:                redisPassword,
-		LogLevel:                     logLevel,
-		JWTSecret:                    jwtSecret,
-		JWTIssuer:                    jwtIssuer,
-		JWTAccessTokenTTL:            jwtTTL,
-		RabbitMQURL:                  rabbitURL,
-		RabbitMQExchange:             rabbitExchange,
-		RabbitMQQueue:                rabbitQueue,
-		RabbitMQRoutingKey:           rabbitRoutingKey,
-		RabbitMQRetryExchange:        retryExchange,
-		RabbitMQRetryQueue:           retryQueue,
-		RabbitMQDeadLetterExchange:   deadLetterExchange,
-		RabbitMQDeadLetterQueue:      deadLetterQueue,
-		RabbitMQDeadLetterRoutingKey: deadLetterRoutingKey,
-		RabbitMQRetryDelay:           retryDelay,
-		OutboxBatchSize:              batchSize,
-		OutboxPollInterval:           pollInterval,
-		OutboxLeaseDuration:          leaseDuration,
-		OutboxMaxBackoff:             maxBackoff,
-		ConsumerMaxRetries:           consumerMaxRetries,
-		ConsumerPrefetchCount:        consumerPrefetch,
-		ConsumerReconnectInterval:    consumerReconnect,
-	}, nil
+	cfg.OutboxBatchSize = batchSize
+	cfg.OutboxPollInterval = pollInterval
+	cfg.OutboxLeaseDuration = leaseDuration
+	cfg.OutboxMaxBackoff = maxBackoff
+	return nil
+}
+
+func loadConsumer(cfg *Config) error {
+	maxRetries, err := intFromEnv("CONSUMER_MAX_RETRIES", 5, 0, 100)
+	if err != nil {
+		return err
+	}
+	prefetch, err := intFromEnv("CONSUMER_PREFETCH_COUNT", 10, 1, 1000)
+	if err != nil {
+		return err
+	}
+	reconnectInterval, err := durationFromEnv("CONSUMER_RECONNECT_INTERVAL", time.Second)
+	if err != nil {
+		return err
+	}
+
+	cfg.ConsumerMaxRetries = maxRetries
+	cfg.ConsumerPrefetchCount = prefetch
+	cfg.ConsumerReconnectInterval = reconnectInterval
+	return nil
 }
 
 func envOrDefault(key, fallback string) string {

@@ -49,12 +49,11 @@ func (s *Service) Transfer(ctx context.Context, userID, sourceWalletID, destinat
 	if sourceWalletID == destinationWalletID {
 		return domain.Transfer{}, false, ErrSameWallet
 	}
-	currency = strings.ToUpper(strings.TrimSpace(currency))
-	switch currency {
-	case "USD", "EUR", "JPY":
-	default:
+	currency = domain.NormalizeCurrency(currency)
+	if !domain.IsSupportedCurrency(currency) {
 		return domain.Transfer{}, false, ErrInvalidCurrency
 	}
+
 	idempotencyKey = strings.TrimSpace(idempotencyKey)
 	if len(idempotencyKey) == 0 || len(idempotencyKey) > maxIdempotencyKeyBytes {
 		return domain.Transfer{}, false, ErrInvalidIdempotencyKey
@@ -67,7 +66,9 @@ func (s *Service) Transfer(ctx context.Context, userID, sourceWalletID, destinat
 	switch {
 	case errors.Is(err, postgres.ErrIdempotencyConflict):
 		return domain.Transfer{}, false, ErrIdempotencyConflict
-	case errors.Is(err, postgres.ErrTransferWalletNotFound), errors.Is(err, postgres.ErrTransferSourceNotOwned):
+	case errors.Is(err, postgres.ErrTransferWalletNotFound),
+		errors.Is(err, postgres.ErrTransferSourceNotOwned),
+		errors.Is(err, postgres.ErrWalletBalanceChanged):
 		return domain.Transfer{}, false, ErrNotFound
 	case errors.Is(err, postgres.ErrTransferCurrencyMismatch):
 		return domain.Transfer{}, false, ErrCurrencyMismatch

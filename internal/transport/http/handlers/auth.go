@@ -4,15 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"io"
 	"log/slog"
-	"mime"
 	"net/http"
 
 	authservice "github.com/Mopcs/mini-payment-system/internal/service/auth"
 )
 
-const maxAuthRequestBytes = 16 << 10
+const maxAuthBodyBytes = 16 << 10
 
 type AuthService interface {
 	Register(context.Context, string, string) (authservice.Result, error)
@@ -64,34 +62,27 @@ func (h *Auth) Register(mux *http.ServeMux) {
 
 func (h *Auth) register(w http.ResponseWriter, r *http.Request) {
 	var request credentialsRequest
-	if err := decodeAuthRequest(w, r, &request); err != nil {
+	if err := decodeJSONRequest(w, r, &request, "credentials", maxAuthBodyBytes); err != nil {
 		writeError(w, err.status, err.code, err.text)
 		return
 	}
+
 	result, err := h.service.Register(r.Context(), request.Email, request.Password)
 	if err != nil {
-		switch {
-		case errors.Is(err, authservice.ErrInvalidEmail):
-			writeError(w, http.StatusBadRequest, "invalid_email", "email address is invalid")
-		case errors.Is(err, authservice.ErrInvalidPassword):
-			writeError(w, http.StatusBadRequest, "invalid_password", "password does not meet the length requirements")
-		case errors.Is(err, authservice.ErrEmailAlreadyRegistered):
-			writeError(w, http.StatusConflict, "email_already_registered", "email is already registered")
-		default:
-			h.logger.Error("registration failed", slog.Any("error", err))
-			writeError(w, http.StatusInternalServerError, "internal_error", "request could not be completed")
-		}
+		h.writeRegisterError(w, err)
 		return
 	}
+
 	writeAuthResponse(w, http.StatusCreated, result)
 }
 
 func (h *Auth) login(w http.ResponseWriter, r *http.Request) {
 	var request credentialsRequest
-	if err := decodeAuthRequest(w, r, &request); err != nil {
+	if err := decodeJSONRequest(w, r, &request, "credentials", maxAuthBodyBytes); err != nil {
 		writeError(w, err.status, err.code, err.text)
 		return
 	}
+
 	result, err := h.service.Login(r.Context(), request.Email, request.Password)
 	if err != nil {
 		if errors.Is(err, authservice.ErrInvalidCredentials) {
@@ -102,29 +93,23 @@ func (h *Auth) login(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "internal_error", "request could not be completed")
 		return
 	}
+
 	writeAuthResponse(w, http.StatusOK, result)
 }
 
-// Mirrors decodeJSONRequest but with its own body size limit.
-func decodeAuthRequest(w http.ResponseWriter, r *http.Request, target *credentialsRequest) *requestDecodeError {
-	contentType, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
-	if err != nil || contentType != "application/json" {
-		return &requestDecodeError{status: http.StatusUnsupportedMediaType, code: "unsupported_media_type", text: "content type must be application/json"}
+// writeRegisterError maps registration errors to the API error contract.
+func (h *Auth) writeRegisterError(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, authservice.ErrInvalidEmail):
+		writeError(w, http.StatusBadRequest, "invalid_email", "email address is invalid")
+	case errors.Is(err, authservice.ErrInvalidPassword):
+		writeError(w, http.StatusBadRequest, "invalid_password", "password does not meet the length requirements")
+	case errors.Is(err, authservice.ErrEmailAlreadyRegistered):
+		writeError(w, http.StatusConflict, "email_already_registered", "email is already registered")
+	default:
+		h.logger.Error("registration failed", slog.Any("error", err))
+		writeError(w, http.StatusInternalServerError, "internal_error", "request could not be completed")
 	}
-
-	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxAuthRequestBytes))
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(target); err != nil {
-		var maxBytesErr *http.MaxBytesError
-		if errors.As(err, &maxBytesErr) {
-			return &requestDecodeError{status: http.StatusRequestEntityTooLarge, code: "request_too_large", text: "request body is too large"}
-		}
-		return &requestDecodeError{status: http.StatusBadRequest, code: "invalid_request", text: "request body must contain valid credentials JSON"}
-	}
-	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
-		return &requestDecodeError{status: http.StatusBadRequest, code: "invalid_request", text: "request body must contain exactly one JSON value"}
-	}
-	return nil
 }
 
 func writeAuthResponse(w http.ResponseWriter, status int, result authservice.Result) {

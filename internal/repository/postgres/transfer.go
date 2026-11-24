@@ -7,12 +7,12 @@ import (
 	"fmt"
 	"math"
 	"strings"
-	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/Mopcs/mini-payment-system/internal/dbutil"
 	"github.com/Mopcs/mini-payment-system/internal/domain"
 )
 
@@ -25,6 +25,14 @@ func NewTransferRepository(pool *pgxpool.Pool) *TransferRepository {
 	return &TransferRepository{pool: pool, outbox: NewOutboxRepository(pool)}
 }
 
+// Conditions shared by the history queries. $1 is always the user ID.
+const (
+	transferVisibleToUser = `(EXISTS (SELECT 1 FROM wallets sw WHERE sw.id = lt.wallet_id AND sw.user_id = $1)
+		OR EXISTS (SELECT 1 FROM wallets dw WHERE dw.id = lt.destination_wallet_id AND dw.user_id = $1))`
+	transferOutgoingFromUser = `EXISTS (SELECT 1 FROM wallets sw WHERE sw.id = lt.wallet_id AND sw.user_id = $1)`
+	transferIncomingToUser   = `EXISTS (SELECT 1 FROM wallets dw WHERE dw.id = lt.destination_wallet_id AND dw.user_id = $1)`
+)
+
 func (r *TransferRepository) List(ctx context.Context, userID uuid.UUID, filter domain.TransferHistoryFilter) ([]domain.TransferHistoryItem, int64, error) {
 	// One snapshot for both the count and the page, so total always matches items.
 	tx, err := r.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
@@ -34,35 +42,17 @@ func (r *TransferRepository) List(ctx context.Context, userID uuid.UUID, filter 
 	defer tx.Rollback(context.WithoutCancel(ctx))
 
 	where, args := transferHistoryWhere(userID, filter)
+
 	total, err := countTransferHistory(ctx, tx, where, args)
 	if err != nil {
 		return nil, 0, err
 	}
-	args = append(args, filter.Limit, filter.Offset)
-	rows, err := tx.Query(ctx, `
-		SELECT lt.id, lt.wallet_id, lt.destination_wallet_id, lt.amount,
-		       lt.currency, lt.created_at
-		FROM ledger_transactions lt
-		`+where+`
-		ORDER BY lt.created_at DESC, lt.id DESC
-		LIMIT $`+fmt.Sprint(len(args)-1)+` OFFSET $`+fmt.Sprint(len(args)), args...)
+
+	items, err := selectTransferHistory(ctx, tx, where, args, filter)
 	if err != nil {
-		return nil, 0, translateError("list transfer history", err)
+		return nil, 0, err
 	}
-	defer rows.Close()
-	items := make([]domain.TransferHistoryItem, 0)
-	for rows.Next() {
-		var item domain.TransferHistoryItem
-		item.Status = "completed"
-		if err := rows.Scan(&item.ID, &item.SourceWalletID, &item.DestinationWalletID,
-			&item.Amount, &item.Currency, &item.CreatedAt); err != nil {
-			return nil, 0, translateError("scan transfer history", err)
-		}
-		items = append(items, item)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, 0, translateError("iterate transfer history", err)
-	}
+
 	if err := tx.Commit(ctx); err != nil {
 		return nil, 0, translateError("commit transfer history transaction", err)
 	}
@@ -86,21 +76,60 @@ func countTransferHistory(ctx context.Context, query transferHistoryQuery, where
 	return total, nil
 }
 
+func selectTransferHistory(ctx context.Context, tx pgx.Tx, where string, args []any, filter domain.TransferHistoryFilter) ([]domain.TransferHistoryItem, error) {
+	limitArg := len(args) + 1
+	offsetArg := limitArg + 1
+	args = append(args, filter.Limit, filter.Offset)
+
+	rows, err := tx.Query(ctx, fmt.Sprintf(`
+		SELECT lt.id, lt.wallet_id, lt.destination_wallet_id, lt.amount,
+		       lt.currency, lt.created_at
+		FROM ledger_transactions lt
+		%s
+		ORDER BY lt.created_at DESC, lt.id DESC
+		LIMIT $%d OFFSET $%d`, where, limitArg, offsetArg), args...)
+	if err != nil {
+		return nil, translateError("list transfer history", err)
+	}
+	defer rows.Close()
+
+	items := make([]domain.TransferHistoryItem, 0)
+	for rows.Next() {
+		var item domain.TransferHistoryItem
+		item.Status = "completed"
+		if err := rows.Scan(
+			&item.ID, &item.SourceWalletID, &item.DestinationWalletID,
+			&item.Amount, &item.Currency, &item.CreatedAt,
+		); err != nil {
+			return nil, translateError("scan transfer history", err)
+		}
+		items = append(items, item)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, translateError("iterate transfer history", err)
+	}
+	return items, nil
+}
+
 func transferHistoryWhere(userID uuid.UUID, filter domain.TransferHistoryFilter) (string, []any) {
 	conditions := []string{
 		"lt.transaction_type = 'transfer'",
-		"(EXISTS (SELECT 1 FROM wallets sw WHERE sw.id = lt.wallet_id AND sw.user_id = $1) OR EXISTS (SELECT 1 FROM wallets dw WHERE dw.id = lt.destination_wallet_id AND dw.user_id = $1))",
+		transferVisibleToUser,
 	}
 	args := []any{userID}
-	if filter.Direction == "outgoing" {
-		conditions = append(conditions, "EXISTS (SELECT 1 FROM wallets sw WHERE sw.id = lt.wallet_id AND sw.user_id = $1)")
-	} else if filter.Direction == "incoming" {
-		conditions = append(conditions, "EXISTS (SELECT 1 FROM wallets dw WHERE dw.id = lt.destination_wallet_id AND dw.user_id = $1)")
+
+	switch filter.Direction {
+	case "outgoing":
+		conditions = append(conditions, transferOutgoingFromUser)
+	case "incoming":
+		conditions = append(conditions, transferIncomingToUser)
 	}
+
 	if filter.Currency != "" {
 		args = append(args, filter.Currency)
 		conditions = append(conditions, fmt.Sprintf("lt.currency = $%d", len(args)))
 	}
+
 	return "WHERE " + strings.Join(conditions, " AND "), args
 }
 
@@ -109,130 +138,46 @@ func (r *TransferRepository) Create(ctx context.Context, userID, sourceID, desti
 	if err != nil {
 		return domain.Transfer{}, false, fmt.Errorf("begin transfer transaction: %w", err)
 	}
-	committed := false
-	defer func() {
-		if committed {
-			return
-		}
-		rollbackCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
-		defer cancel()
-		if rollbackErr := tx.Rollback(rollbackCtx); rollbackErr != nil && !errors.Is(rollbackErr, pgx.ErrTxClosed) {
-			returnedErr = errors.Join(returnedErr, fmt.Errorf("rollback transfer transaction: %w", rollbackErr))
-		}
-	}()
+	defer dbutil.Rollback(ctx, tx, &returnedErr)
 
-	transactionID := uuid.New()
-	destinationPointer := &destinationID
-	transactionID, createdAt, replay, err := claimLedgerTransaction(ctx, tx, userID, transactionID, "transfer", key, requestHash, sourceID, destinationPointer, currency, amount)
+	plan := transferPlan{
+		userID:        userID,
+		sourceID:      sourceID,
+		destinationID: destinationID,
+		amount:        amount,
+		currency:      currency,
+	}
+
+	transactionID, createdAt, replay, err := claimLedgerTransaction(ctx, tx, ledgerTransaction{
+		id:                  uuid.New(),
+		userID:              userID,
+		transactionType:     "transfer",
+		idempotencyKey:      key,
+		requestHash:         requestHash,
+		sourceWalletID:      sourceID,
+		destinationWalletID: &destinationID,
+		currency:            currency,
+		amount:              amount,
+	})
 	if err != nil {
 		return domain.Transfer{}, false, fmt.Errorf("claim transfer idempotency key: %w", err)
 	}
 	if replay {
-		var existing domain.Transfer
-		err = tx.QueryRow(ctx, `
-			SELECT id, wallet_id, destination_wallet_id, amount, currency,
-			       balance_after, destination_balance_after, created_at
-			FROM ledger_transactions
-			WHERE id = $1`, transactionID,
-		).Scan(&existing.TransactionID, &existing.SourceWalletID, &existing.DestinationWalletID,
-			&existing.Amount, &existing.Currency, &existing.SourceBalanceAfter,
-			&existing.DestinationBalanceAfter, &existing.CreatedAt)
-		if err != nil {
-			return domain.Transfer{}, false, translateError("load transfer result", err)
-		}
-		if err := tx.Commit(ctx); err != nil {
-			return domain.Transfer{}, false, fmt.Errorf("commit idempotent transfer lookup: %w", err)
-		}
-		committed = true
-		return existing, true, nil
+		return replayTransfer(ctx, tx, transactionID)
 	}
 
-	// Lock both wallets in UUID order so A->B and B->A can't deadlock each other.
-	lockOrder := []uuid.UUID{sourceID, destinationID}
-	if bytes.Compare(lockOrder[0][:], lockOrder[1][:]) > 0 {
-		lockOrder[0], lockOrder[1] = lockOrder[1], lockOrder[0]
-	}
-	// Missing rows are skipped and reported after the loop, so the caller can't
-	// tell a nonexistent wallet from one that belongs to somebody else.
-	locked := make(map[uuid.UUID]lockedTransferWallet, 2)
-	for _, walletID := range lockOrder {
-		var wallet lockedTransferWallet
-		err := tx.QueryRow(ctx, `
-			SELECT user_id, currency, balance
-			FROM wallets
-			WHERE id = $1
-			FOR UPDATE`, walletID,
-		).Scan(&wallet.userID, &wallet.currency, &wallet.balance)
-		if errors.Is(err, pgx.ErrNoRows) {
-			continue
-		}
-		if err != nil {
-			return domain.Transfer{}, false, translateError("lock transfer wallet", err)
-		}
-		locked[walletID] = wallet
-	}
-	source, sourceExists := locked[sourceID]
-	destination, destinationExists := locked[destinationID]
-	if !sourceExists || !destinationExists {
-		return domain.Transfer{}, false, ErrTransferWalletNotFound
-	}
-	// Someone else's wallet is treated exactly like a missing one.
-	if source.userID != userID {
-		return domain.Transfer{}, false, ErrTransferSourceNotOwned
-	}
-	if source.currency != currency || destination.currency != currency {
-		return domain.Transfer{}, false, ErrTransferCurrencyMismatch
-	}
-	if amount > source.balance {
-		return domain.Transfer{}, false, ErrInsufficientFunds
-	}
-	if amount > math.MaxInt64-destination.balance {
-		return domain.Transfer{}, false, ErrBalanceOverflow
-	}
-
-	sourceAccountID, err := transferWalletAccount(ctx, tx, sourceID, currency)
-	if err != nil {
-		return domain.Transfer{}, false, err
-	}
-	destinationAccountID, err := transferWalletAccount(ctx, tx, destinationID, currency)
+	source, destination, err := lockTransferWallets(ctx, tx, plan)
 	if err != nil {
 		return domain.Transfer{}, false, err
 	}
 
-	sourceBalanceAfter := source.balance - amount
-	destinationBalanceAfter := destination.balance + amount
-	if err := updateTransferBalance(ctx, tx, sourceID, source.balance, sourceBalanceAfter); err != nil {
-		return domain.Transfer{}, false, fmt.Errorf("debit transfer source: %w", err)
-	}
-	if err := updateTransferBalance(ctx, tx, destinationID, destination.balance, destinationBalanceAfter); err != nil {
-		return domain.Transfer{}, false, fmt.Errorf("credit transfer destination: %w", err)
-	}
-	if _, err := tx.Exec(ctx, `
-		UPDATE ledger_transactions
-		SET balance_after = $1, destination_balance_after = $2
-		WHERE id = $3`, sourceBalanceAfter, destinationBalanceAfter, transactionID); err != nil {
-		return domain.Transfer{}, false, translateError("store transfer result", err)
-	}
-	if _, err := tx.Exec(ctx, `
-		INSERT INTO ledger_entries (transaction_id, account_id, amount)
-		VALUES ($1, $2, $3), ($1, $4, $5)`, transactionID, sourceAccountID, -amount, destinationAccountID, amount,
-	); err != nil {
-		return domain.Transfer{}, false, translateError("write transfer ledger entries", err)
+	sourceAfter, destinationAfter, err := applyTransfer(ctx, tx, transactionID, plan, source, destination)
+	if err != nil {
+		return domain.Transfer{}, false, err
 	}
 
-	// Cheap sanity check before commit: two entries, net zero, one currency.
-	var balanced bool
-	if err := tx.QueryRow(ctx, `
-		SELECT count(*) = 2 AND COALESCE(sum(le.amount), 0) = 0
-		   AND count(DISTINCT la.currency) = 1
-		FROM ledger_entries le
-		JOIN ledger_accounts la ON la.id = le.account_id
-		WHERE le.transaction_id = $1`, transactionID,
-	).Scan(&balanced); err != nil {
-		return domain.Transfer{}, false, translateError("verify transfer ledger", err)
-	}
-	if !balanced {
-		return domain.Transfer{}, false, fmt.Errorf("verify transfer ledger: %w", ErrCheckViolation)
+	if err := verifyLedgerBalanced(ctx, tx, transactionID, 2); err != nil {
+		return domain.Transfer{}, false, err
 	}
 
 	result = domain.Transfer{
@@ -241,31 +186,53 @@ func (r *TransferRepository) Create(ctx context.Context, userID, sourceID, desti
 		DestinationWalletID:     destinationID,
 		Amount:                  amount,
 		Currency:                currency,
-		SourceBalanceAfter:      sourceBalanceAfter,
-		DestinationBalanceAfter: destinationBalanceAfter,
+		SourceBalanceAfter:      sourceAfter,
+		DestinationBalanceAfter: destinationAfter,
 		CreatedAt:               createdAt,
 	}
-	if err := r.outbox.Create(ctx, tx, domain.OutboxEvent{
-		ID:            uuid.New(),
-		AggregateID:   transactionID,
-		AggregateType: "transfer",
-		EventType:     domain.EventTypeTransferCompleted,
-		Payload: domain.TransferCompletedPayload{
-			TransferID:          transactionID,
-			SourceWalletID:      sourceID,
-			DestinationWalletID: destinationID,
-			Amount:              amount,
-			Currency:            currency,
-			CompletedAt:         createdAt,
-		},
-	}); err != nil {
+
+	if err := r.recordCompleted(ctx, tx, result); err != nil {
 		return domain.Transfer{}, false, err
 	}
+
 	if err := tx.Commit(ctx); err != nil {
 		return domain.Transfer{}, false, translateError("commit transfer transaction", err)
 	}
-	committed = true
 	return result, false, nil
+}
+
+// replayTransfer loads the result of a request that was already applied.
+func replayTransfer(ctx context.Context, tx pgx.Tx, transactionID uuid.UUID) (domain.Transfer, bool, error) {
+	var existing domain.Transfer
+	err := tx.QueryRow(ctx, `
+		SELECT id, wallet_id, destination_wallet_id, amount, currency,
+		       balance_after, destination_balance_after, created_at
+		FROM ledger_transactions
+		WHERE id = $1`,
+		transactionID,
+	).Scan(
+		&existing.TransactionID, &existing.SourceWalletID, &existing.DestinationWalletID,
+		&existing.Amount, &existing.Currency, &existing.SourceBalanceAfter,
+		&existing.DestinationBalanceAfter, &existing.CreatedAt,
+	)
+	if err != nil {
+		return domain.Transfer{}, false, translateError("load transfer result", err)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return domain.Transfer{}, false, fmt.Errorf("commit idempotent transfer lookup: %w", err)
+	}
+	return existing, true, nil
+}
+
+// transferPlan is the validated request. Every step below works on the same
+// values, and passing them as one struct keeps the helpers short.
+type transferPlan struct {
+	userID        uuid.UUID
+	sourceID      uuid.UUID
+	destinationID uuid.UUID
+	amount        int64
+	currency      string
 }
 
 type lockedTransferWallet struct {
@@ -274,32 +241,123 @@ type lockedTransferWallet struct {
 	balance  int64
 }
 
-func transferWalletAccount(ctx context.Context, tx pgx.Tx, walletID uuid.UUID, currency string) (uuid.UUID, error) {
-	var accountID uuid.UUID
-	err := tx.QueryRow(ctx, `
-		SELECT id FROM ledger_accounts
-		WHERE account_type = 'wallet' AND wallet_id = $1 AND currency = $2`, walletID, currency,
-	).Scan(&accountID)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return uuid.Nil, ErrLedgerAccountMissing
+// lockTransferWallets locks both wallet rows in UUID order so A->B and B->A
+// cannot deadlock each other, then checks that the transfer is allowed.
+func lockTransferWallets(ctx context.Context, tx pgx.Tx, plan transferPlan) (lockedTransferWallet, lockedTransferWallet, error) {
+	first, second := plan.sourceID, plan.destinationID
+	if bytes.Compare(first[:], second[:]) > 0 {
+		first, second = second, first
 	}
-	if err != nil {
-		return uuid.Nil, translateError("load transfer wallet ledger account", err)
+
+	locked := make(map[uuid.UUID]lockedTransferWallet, 2)
+	for _, walletID := range []uuid.UUID{first, second} {
+		wallet, found, err := lockTransferWallet(ctx, tx, walletID)
+		if err != nil {
+			return lockedTransferWallet{}, lockedTransferWallet{}, err
+		}
+		if found {
+			locked[walletID] = wallet
+		}
 	}
-	return accountID, nil
+
+	source, sourceExists := locked[plan.sourceID]
+	destination, destinationExists := locked[plan.destinationID]
+
+	// A missing wallet and somebody else's wallet report the same error, so the
+	// caller cannot probe for wallets they do not own.
+	if !sourceExists || !destinationExists {
+		return lockedTransferWallet{}, lockedTransferWallet{}, ErrTransferWalletNotFound
+	}
+	if source.userID != plan.userID {
+		return lockedTransferWallet{}, lockedTransferWallet{}, ErrTransferSourceNotOwned
+	}
+	if source.currency != plan.currency || destination.currency != plan.currency {
+		return lockedTransferWallet{}, lockedTransferWallet{}, ErrTransferCurrencyMismatch
+	}
+	if plan.amount > source.balance {
+		return lockedTransferWallet{}, lockedTransferWallet{}, ErrInsufficientFunds
+	}
+	if plan.amount > math.MaxInt64-destination.balance { // would wrap the destination
+		return lockedTransferWallet{}, lockedTransferWallet{}, ErrBalanceOverflow
+	}
+	return source, destination, nil
 }
 
-// updateTransferBalance writes the new balance only if it still matches the one
-// we read under the lock. Zero rows means somebody moved it and we back off.
-func updateTransferBalance(ctx context.Context, tx pgx.Tx, walletID uuid.UUID, previous, updated int64) error {
-	tag, err := tx.Exec(ctx, `
-		UPDATE wallets SET balance = $1, updated_at = CURRENT_TIMESTAMP
-		WHERE id = $2 AND balance = $3`, updated, walletID, previous)
+func lockTransferWallet(ctx context.Context, tx pgx.Tx, walletID uuid.UUID) (lockedTransferWallet, bool, error) {
+	var wallet lockedTransferWallet
+	err := tx.QueryRow(ctx, `
+		SELECT user_id, currency, balance
+		FROM wallets
+		WHERE id = $1
+		FOR UPDATE`,
+		walletID,
+	).Scan(&wallet.userID, &wallet.currency, &wallet.balance)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return lockedTransferWallet{}, false, nil
+	}
 	if err != nil {
-		return translateError("update transfer wallet balance", err)
+		return lockedTransferWallet{}, false, translateError("lock transfer wallet", err)
 	}
-	if tag.RowsAffected() != 1 {
-		return ErrTransferWalletNotFound
+	return wallet, true, nil
+}
+
+// applyTransfer moves the money: both wallet balances, the transaction row, and
+// the two ledger entries.
+func applyTransfer(ctx context.Context, tx pgx.Tx, transactionID uuid.UUID, plan transferPlan, source, destination lockedTransferWallet) (int64, int64, error) {
+	sourceAccountID, err := walletLedgerAccount(ctx, tx, plan.sourceID, plan.currency)
+	if err != nil {
+		return 0, 0, err
 	}
-	return nil
+	destinationAccountID, err := walletLedgerAccount(ctx, tx, plan.destinationID, plan.currency)
+	if err != nil {
+		return 0, 0, err
+	}
+
+	sourceAfter := source.balance - plan.amount
+	destinationAfter := destination.balance + plan.amount
+
+	if err := updateWalletBalance(ctx, tx, plan.sourceID, source.balance, sourceAfter); err != nil {
+		return 0, 0, fmt.Errorf("debit transfer source: %w", err)
+	}
+	if err := updateWalletBalance(ctx, tx, plan.destinationID, destination.balance, destinationAfter); err != nil {
+		return 0, 0, fmt.Errorf("credit transfer destination: %w", err)
+	}
+
+	if _, err := tx.Exec(ctx, `
+		UPDATE ledger_transactions
+		SET balance_after = $1, destination_balance_after = $2
+		WHERE id = $3`,
+		sourceAfter, destinationAfter, transactionID,
+	); err != nil {
+		return 0, 0, translateError("store transfer result", err)
+	}
+
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO ledger_entries (transaction_id, account_id, amount)
+		VALUES ($1, $2, $3), ($1, $4, $5)`,
+		transactionID, sourceAccountID, -plan.amount, destinationAccountID, plan.amount,
+	); err != nil {
+		return 0, 0, translateError("write transfer ledger entries", err)
+	}
+
+	return sourceAfter, destinationAfter, nil
+}
+
+// recordCompleted queues the transfer.completed event in the same transaction,
+// so the outbox worker can never publish a transfer that was rolled back.
+func (r *TransferRepository) recordCompleted(ctx context.Context, tx pgx.Tx, transfer domain.Transfer) error {
+	return r.outbox.Create(ctx, tx, domain.OutboxEvent{
+		ID:            uuid.New(),
+		AggregateID:   transfer.TransactionID,
+		AggregateType: "transfer",
+		EventType:     domain.EventTypeTransferCompleted,
+		Payload: domain.TransferCompletedPayload{
+			TransferID:          transfer.TransactionID,
+			SourceWalletID:      transfer.SourceWalletID,
+			DestinationWalletID: transfer.DestinationWalletID,
+			Amount:              transfer.Amount,
+			Currency:            transfer.Currency,
+			CompletedAt:         transfer.CreatedAt,
+		},
+	})
 }
