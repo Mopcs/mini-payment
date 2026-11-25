@@ -14,7 +14,7 @@ A Go modular monolith for processing payments between users. PostgreSQL is the s
 1. Copy `.env.example` to `.env` and adjust the local credentials if needed.
 2. Start Docker Desktop (or another Docker Engine with Compose).
 3. Run `make config` to validate the Compose configuration.
-4. Run `make up` to start PostgreSQL, Redis, RabbitMQ, Prometheus, and Grafana.
+4. Run `make up` to start PostgreSQL, Redis, RabbitMQ, Prometheus, Grafana, and Jaeger.
 5. Run `make ps` to check container health.
 6. Start the API with `go run ./cmd/api`.
 7. Check `http://localhost:8080/health` and `http://localhost:8080/ready`.
@@ -55,6 +55,12 @@ All services publish ports only on `127.0.0.1`. Their data is stored in Docker n
 | `GRAFANA_PORT` | Published Grafana port | `3000` |
 | `GRAFANA_ADMIN_USER` | Grafana administrator login | `admin` |
 | `GRAFANA_ADMIN_PASSWORD` | Grafana administrator password | set in `.env`, never commit it |
+| `OTEL_TRACING_ENABLED` | Turn tracing on or off | `true` |
+| `OTEL_SERVICE_NAME` | Overrides the per-process service name | unset by default |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | OTLP gRPC target, `host:port` or a URL | `localhost:4317` |
+| `OTEL_TRACES_SAMPLER` | Sampler name | `parentbased_traceidratio` |
+| `OTEL_TRACES_SAMPLER_ARG` | Sampling ratio for the ratio samplers, 0 to 1 | `1.0` |
+| `JAEGER_UI_PORT` / `JAEGER_OTLP_PORT` | Published Jaeger ports | `16686` / `4317` |
 
 Compose requires PostgreSQL and Redis passwords from `.env`; RabbitMQ fallback credentials are for local development only.
 Environment variables already set in the shell take precedence over values loaded from `.env`.
@@ -361,3 +367,126 @@ curl http://127.0.0.1:9090/api/v1/targets
 `validate_dashboards.py` needs only the standard library and a reachable
 Prometheus. It substitutes the Grafana-only variables and reports `OK`, `EMPTY`,
 or `ERROR` for every panel query.
+
+## Distributed tracing
+
+Every process exports OpenTelemetry traces over OTLP. A transfer can be followed
+from the HTTP request that accepted it, through the transaction and the outbox,
+across RabbitMQ, and into the consumer that records the notification.
+
+### Components and span names
+
+| Process | Span | What it covers |
+| --- | --- | --- |
+| API | `POST /api/v1/transfers` | Incoming HTTP request, named after the route pattern |
+| API | `transfer.validate` | Request validation before any database work |
+| API | `transfer.create` | The whole transfer transaction |
+| API | `transfer.claim_idempotency`, `transfer.lock_wallets`, `transfer.update_balances`, `transfer.write_ledger_entries`, `transfer.commit` | Transaction steps |
+| API | `outbox.enqueue` | Writing the `transfer.completed` event |
+| Worker | `outbox.claim`, `outbox.publish`, `outbox.mark_published`, `outbox.schedule_retry` | Publishing loop |
+| Consumer | `consumer.process`, `consumer.decode`, `notification.record` | Delivery handling |
+| All | `SELECT`, `INSERT`, `UPDATE`, `BEGIN`, `COMMIT`, `pool.acquire` | pgx, created by `otelpgx` |
+
+The database spans come from the pgx tracer, so the repository does not wrap
+every query by hand.
+
+### Enable and disable
+
+Tracing is on by default. Set `OTEL_TRACING_ENABLED=false` to turn it off: no
+exporter is created, no spans are produced, and the global provider stays
+untouched. The processes behave exactly as they did before tracing existed, so
+environments without a collector can keep it disabled.
+
+### Service names and endpoint
+
+`OTEL_EXPORTER_OTLP_ENDPOINT` defaults to `localhost:4317`. Both `host:port` and
+a URL are accepted; `https://` turns on TLS, `http://` and bare `host:port` do
+not. Each binary uses its own default service name — `mini-payment-api`,
+`mini-payment-worker`, `mini-payment-consumer` — and `OTEL_SERVICE_NAME`
+overrides all three when you want a single name.
+
+Spans are batched and flushed on shutdown with a five second timeout, so a
+SIGTERM does not drop the tail of a trace.
+
+### Sampling
+
+`OTEL_TRACES_SAMPLER` accepts `always_on`, `always_off`, `traceidratio`,
+`parentbased_always_on`, `parentbased_always_off`, and
+`parentbased_traceidratio`. The default is `parentbased_traceidratio` with
+`OTEL_TRACES_SAMPLER_ARG=1.0`, which samples everything locally but still
+respects a sampling decision made upstream. For a busy environment start with
+`0.1` and lower it from there.
+
+### Trace context propagation
+
+The context travels as a W3C `traceparent` header. Nothing is stored in the
+event payload, so the financial contract is unchanged.
+
+| Hop | Where the context lives |
+| --- | --- |
+| Client → API | `traceparent` request header |
+| API → outbox | `outbox_events.trace_parent` and `trace_state` columns |
+| Worker → RabbitMQ | `traceparent` AMQP header |
+| RabbitMQ → consumer | the same AMQP header |
+
+The worker runs in another process, so it rebuilds the context from the
+database columns instead of relying on memory. The consumer does not continue
+the producer trace as a child: it starts a new trace and adds a span link, so
+the producer span is not stretched across the time the message waited in the
+queue. In Jaeger the link shows up as a `FOLLOWS_FROM` reference.
+
+Migration `000008_add_outbox_trace_context` adds the two columns with an empty
+default, so rows written before this change simply start a new trace.
+
+### Local backend
+
+Jaeger is part of the Compose stack:
+
+```sh
+docker compose up -d jaeger
+```
+
+- UI: `http://127.0.0.1:16686`
+- OTLP gRPC ingestion: `127.0.0.1:4317`
+
+Both ports bind to loopback. Jaeger stores traces in memory, so they disappear
+when the container stops.
+
+To run without Jaeger, either leave it out of `docker compose up` and set
+`OTEL_TRACING_ENABLED=false`, or keep tracing on and accept that exports fail
+quietly — the batch processor drops spans and the processes keep running.
+
+### Finding a trace
+
+Paste the trace ID into the search box in the Jaeger UI, or query the API:
+
+```sh
+curl "http://127.0.0.1:16686/api/traces/<trace-id>"
+```
+
+Log lines carry the same identifiers, so the fastest path from a log record to
+a trace is to copy `trace_id` from the JSON log and search for it. A record
+logged with a context gets `trace_id` and `span_id` appended automatically by
+the shared handler.
+
+### Privacy
+
+- Spans record `http.route` (the pattern, for example `/api/v1/wallets/{id}`)
+  and never `url.path`, so wallet and transfer identifiers stay out of traces.
+- Authorization headers, cookies, passwords, and request bodies are not
+  recorded. The middleware sets no header attributes at all.
+- Idempotency keys are never attached to a span.
+- `otelpgx` records the SQL statement text but not the bind parameters, so
+  amounts and identifiers are not visible in database spans.
+- Error status messages carry the Go error text, which describes the failure
+  rather than the data.
+
+### Troubleshooting
+
+| Symptom | Cause and fix |
+| --- | --- |
+| No traces at all | `OTEL_TRACING_ENABLED` is `false`, or the endpoint points somewhere unreachable. Check the `tracing enabled` log line for the resolved service, endpoint, and sampler. |
+| Only API spans, no worker spans | The worker is not running, or it started before migration `000008` was applied. |
+| Only the API span, no transaction steps | The pool was created before tracing started; the tracer is attached when the pool is built. |
+| Consumer trace has no link | The message was published without a `traceparent` header, which happens when the worker ran with tracing disabled. |
+| Jaeger UI is empty but spans are exported | Jaeger keeps traces in memory and restarts empty. Check the time range in the UI. |
