@@ -75,3 +75,51 @@ func signTestToken(t *testing.T, secret string, claims jwt.Claims) string {
 	}
 	return encoded
 }
+
+// Only HS256 is accepted, so a token signed with a different HMAC variant must
+// be rejected even when the secret matches.
+func TestTokenValidationRejectsUnsupportedAlgorithm(t *testing.T) {
+	manager, err := NewTokenManager(testJWTSecret, "test-issuer", time.Minute)
+	if err != nil {
+		t.Fatalf("NewTokenManager() error = %v", err)
+	}
+
+	now := time.Now().UTC()
+	token := jwt.NewWithClaims(jwt.SigningMethodHS512, jwt.RegisteredClaims{
+		Issuer:    "test-issuer",
+		Subject:   uuid.NewString(),
+		IssuedAt:  jwt.NewNumericDate(now),
+		ExpiresAt: jwt.NewNumericDate(now.Add(time.Minute)),
+	})
+	signed, err := token.SignedString([]byte(testJWTSecret))
+	if err != nil {
+		t.Fatalf("sign HS512 token: %v", err)
+	}
+
+	if _, err := manager.Validate(signed); err == nil {
+		t.Fatal("HS512 token was accepted, want rejection")
+	}
+}
+
+// A token without a subject identifies nobody, so it must not authenticate.
+func TestTokenValidationRejectsMissingSubject(t *testing.T) {
+	manager, err := NewTokenManager(testJWTSecret, "test-issuer", time.Minute)
+	if err != nil {
+		t.Fatalf("NewTokenManager() error = %v", err)
+	}
+
+	now := time.Now().UTC()
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.RegisteredClaims{
+		Issuer:    "test-issuer",
+		IssuedAt:  jwt.NewNumericDate(now),
+		ExpiresAt: jwt.NewNumericDate(now.Add(time.Minute)),
+	})
+	signed, err := token.SignedString([]byte(testJWTSecret))
+	if err != nil {
+		t.Fatalf("sign token without subject: %v", err)
+	}
+
+	if _, err := manager.Validate(signed); err == nil {
+		t.Fatal("token without a subject was accepted")
+	}
+}
