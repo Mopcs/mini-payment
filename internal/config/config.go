@@ -11,6 +11,8 @@ import (
 	"time"
 
 	"github.com/joho/godotenv"
+
+	"github.com/Mopcs/mini-payment-system/internal/observability"
 )
 
 const (
@@ -53,6 +55,12 @@ type Config struct {
 	APIMetricsAddr               string
 	WorkerMetricsAddr            string
 	ConsumerMetricsAddr          string
+	TracingEnabled               bool
+	TracingServiceName           string
+	TracingEndpoint              string
+	TracingInsecure              bool
+	TracingSampler               string
+	TracingSamplerArg            float64
 }
 
 // Load reads .env when it exists, then the environment, and validates every
@@ -81,6 +89,7 @@ func Load() (Config, error) {
 		loadOutbox,
 		loadConsumer,
 		loadMetrics,
+		loadTracing,
 	}
 	for _, load := range loaders {
 		if err := load(&cfg); err != nil {
@@ -89,6 +98,24 @@ func Load() (Config, error) {
 	}
 
 	return cfg, nil
+}
+
+// TracingSettings builds the tracer configuration for one process. Each binary
+// passes its own default service name, which OTEL_SERVICE_NAME can override.
+func (c Config) TracingSettings(defaultServiceName string) observability.TracingSettings {
+	service := c.TracingServiceName
+	if service == "" {
+		service = defaultServiceName
+	}
+
+	return observability.TracingSettings{
+		Enabled:     c.TracingEnabled,
+		ServiceName: service,
+		Endpoint:    c.TracingEndpoint,
+		Insecure:    c.TracingInsecure,
+		Sampler:     c.TracingSampler,
+		SamplerArg:  c.TracingSamplerArg,
+	}
 }
 
 func loadMetrics(cfg *Config) error {
@@ -132,6 +159,72 @@ func validateListenAddress(key, address string) (int, error) {
 		return 0, fmt.Errorf("%s port must be between 1 and 65535", key)
 	}
 	return port, nil
+}
+
+// knownSamplers lists the sampler names the tracer understands.
+var knownSamplers = map[string]struct{}{
+	"always_on":                {},
+	"always_off":               {},
+	"traceidratio":             {},
+	"parentbased_always_on":    {},
+	"parentbased_always_off":   {},
+	"parentbased_traceidratio": {},
+}
+
+// loadTracing reads the OpenTelemetry settings. An empty service name is
+// allowed, because each executable supplies its own default.
+func loadTracing(cfg *Config) error {
+	enabled, err := boolFromEnv("OTEL_TRACING_ENABLED", true)
+	if err != nil {
+		return err
+	}
+
+	endpoint, insecure, err := traceEndpoint(
+		envOrDefault("OTEL_EXPORTER_OTLP_ENDPOINT", "localhost:4317"),
+	)
+	if err != nil {
+		return err
+	}
+
+	samplerName := envOrDefault("OTEL_TRACES_SAMPLER", "parentbased_traceidratio")
+	sampler := strings.ToLower(strings.TrimSpace(samplerName))
+	if _, ok := knownSamplers[sampler]; !ok {
+		return errors.New("OTEL_TRACES_SAMPLER must be a supported sampler name")
+	}
+
+	ratio, err := floatFromEnv("OTEL_TRACES_SAMPLER_ARG", 1)
+	if err != nil || ratio < 0 || ratio > 1 {
+		return errors.New("OTEL_TRACES_SAMPLER_ARG must be between 0 and 1")
+	}
+
+	cfg.TracingEnabled = enabled
+	cfg.TracingServiceName = strings.TrimSpace(envOrDefault("OTEL_SERVICE_NAME", ""))
+	cfg.TracingEndpoint = endpoint
+	cfg.TracingInsecure = insecure
+	cfg.TracingSampler = sampler
+	cfg.TracingSamplerArg = ratio
+	return nil
+}
+
+// traceEndpoint accepts host:port or a URL and reports whether TLS is skipped.
+func traceEndpoint(value string) (string, bool, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "", false, errors.New("OTEL_EXPORTER_OTLP_ENDPOINT is required")
+	}
+
+	if !strings.Contains(value, "://") {
+		if _, _, err := net.SplitHostPort(value); err != nil {
+			return "", false, errors.New("OTEL_EXPORTER_OTLP_ENDPOINT must be host:port or a URL")
+		}
+		return value, true, nil
+	}
+
+	parsed, err := url.Parse(value)
+	if err != nil || parsed.Host == "" {
+		return "", false, errors.New("OTEL_EXPORTER_OTLP_ENDPOINT must be host:port or a URL")
+	}
+	return parsed.Host, parsed.Scheme != "https", nil
 }
 
 // loadConnections validates the PostgreSQL and Redis endpoints.
@@ -332,6 +425,32 @@ func durationFromEnv(key string, fallback time.Duration) (time.Duration, error) 
 	parsed, err := time.ParseDuration(value)
 	if err != nil || parsed < time.Microsecond {
 		return 0, fmt.Errorf("%s must be a positive duration", key)
+	}
+	return parsed, nil
+}
+
+func boolFromEnv(key string, fallback bool) (bool, error) {
+	value, ok := os.LookupEnv(key)
+	if !ok || strings.TrimSpace(value) == "" {
+		return fallback, nil
+	}
+
+	parsed, err := strconv.ParseBool(strings.TrimSpace(value))
+	if err != nil {
+		return false, fmt.Errorf("%s must be true or false", key)
+	}
+	return parsed, nil
+}
+
+func floatFromEnv(key string, fallback float64) (float64, error) {
+	value, ok := os.LookupEnv(key)
+	if !ok || strings.TrimSpace(value) == "" {
+		return fallback, nil
+	}
+
+	parsed, err := strconv.ParseFloat(strings.TrimSpace(value), 64)
+	if err != nil {
+		return 0, fmt.Errorf("%s must be a number", key)
 	}
 	return parsed, nil
 }

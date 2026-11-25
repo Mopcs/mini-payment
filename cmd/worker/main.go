@@ -20,7 +20,7 @@ import (
 
 func main() {
 	cfg, err := config.Load()
-	logger := newLogger(cfg.LogLevel)
+	logger := observability.NewLogger(cfg.LogLevel)
 	if err != nil {
 		logger.Error("load configuration", slog.Any("error", err))
 		os.Exit(1)
@@ -34,6 +34,14 @@ func main() {
 func run(cfg config.Config, logger *slog.Logger) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	shutdownTracing, err := observability.StartTracing(
+		ctx, cfg.TracingSettings("mini-payment-worker"), logger,
+	)
+	if err != nil {
+		return fmt.Errorf("start tracing: %w", err)
+	}
+	defer observability.ShutdownTracing(shutdownTracing, logger)
 
 	pool, err := postgres.NewPool(ctx, cfg)
 	if err != nil {
@@ -103,17 +111,4 @@ func pingPool(ctx context.Context, pool *pgxpool.Pool) error {
 	pingCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	return pool.Ping(pingCtx)
-}
-
-func newLogger(levelName string) *slog.Logger {
-	level := slog.LevelInfo
-	switch levelName {
-	case "debug":
-		level = slog.LevelDebug
-	case "warn":
-		level = slog.LevelWarn
-	case "error":
-		level = slog.LevelError
-	}
-	return slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: level}))
 }

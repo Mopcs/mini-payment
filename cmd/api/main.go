@@ -43,7 +43,7 @@ type apiServerDependencies struct {
 
 func main() {
 	cfg, err := config.Load()
-	logger := newLogger(cfg.LogLevel)
+	logger := observability.NewLogger(cfg.LogLevel)
 	if err != nil {
 		logger.Error("load configuration", slog.Any("error", err))
 		os.Exit(1)
@@ -54,22 +54,17 @@ func main() {
 	}
 }
 
-func newLogger(levelName string) *slog.Logger {
-	level := slog.LevelInfo
-	switch levelName {
-	case "debug":
-		level = slog.LevelDebug
-	case "warn":
-		level = slog.LevelWarn
-	case "error":
-		level = slog.LevelError
-	}
-	return slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: level}))
-}
-
 func run(cfg config.Config, logger *slog.Logger) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	shutdownTracing, err := observability.StartTracing(
+		ctx, cfg.TracingSettings("mini-payment-api"), logger,
+	)
+	if err != nil {
+		return fmt.Errorf("start tracing: %w", err)
+	}
+	defer observability.ShutdownTracing(shutdownTracing, logger)
 
 	app, err := newRuntime(ctx, cfg, logger)
 	if err != nil {
