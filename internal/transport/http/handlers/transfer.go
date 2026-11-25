@@ -25,8 +25,17 @@ const (
 )
 
 type TransferService interface {
-	Transfer(context.Context, uuid.UUID, uuid.UUID, uuid.UUID, int64, string, string) (domain.Transfer, bool, error)
-	List(context.Context, uuid.UUID, domain.TransferHistoryFilter) ([]domain.TransferHistoryItem, int64, error)
+	Transfer(
+		context.Context,
+		uuid.UUID, uuid.UUID, uuid.UUID,
+		int64,
+		string, string,
+	) (domain.Transfer, bool, error)
+	List(
+		context.Context,
+		uuid.UUID,
+		domain.TransferHistoryFilter,
+	) ([]domain.TransferHistoryItem, int64, error)
 }
 
 type Transfers struct {
@@ -72,20 +81,20 @@ func (h *Transfers) Register(mux *http.ServeMux, tokens middleware.TokenValidato
 func (h *Transfers) list(w http.ResponseWriter, r *http.Request) {
 	userID, ok := middleware.UserID(r.Context())
 	if !ok {
-		writeError(w, http.StatusUnauthorized, "unauthorized", "authentication required")
+		unauthorized(w)
 		return
 	}
 
 	filter, err := parseTransferHistoryFilter(r)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_query", err.Error())
+		badRequest(w, "invalid_query", err.Error())
 		return
 	}
 
 	items, total, err := h.service.List(r.Context(), userID, filter)
 	if err != nil {
-		h.logger.Error("transfer history failed", slog.Any("error", err))
-		writeError(w, http.StatusInternalServerError, "internal_error", "request could not be completed")
+		h.logger.ErrorContext(r.Context(), "transfer history failed", slog.Any("error", err))
+		internalError(w)
 		return
 	}
 
@@ -101,7 +110,7 @@ func (h *Transfers) list(w http.ResponseWriter, r *http.Request) {
 func (h *Transfers) create(w http.ResponseWriter, r *http.Request) {
 	userID, ok := middleware.UserID(r.Context())
 	if !ok {
-		writeError(w, http.StatusUnauthorized, "unauthorized", "authentication required")
+		unauthorized(w)
 		return
 	}
 
@@ -118,7 +127,7 @@ func (h *Transfers) create(w http.ResponseWriter, r *http.Request) {
 		r.Header.Get("Idempotency-Key"),
 	)
 	if err != nil {
-		h.writeTransferError(w, err)
+		h.writeTransferError(r.Context(), w, err)
 		return
 	}
 
@@ -140,31 +149,35 @@ func (h *Transfers) create(w http.ResponseWriter, r *http.Request) {
 }
 
 // writeTransferError maps service errors to the API error contract.
-func (h *Transfers) writeTransferError(w http.ResponseWriter, err error) {
+func (h *Transfers) writeTransferError(
+	ctx context.Context,
+	w http.ResponseWriter,
+	err error,
+) {
 	switch {
 	case errors.Is(err, transferservice.ErrInvalidAmount):
-		writeError(w, http.StatusBadRequest, "invalid_amount", "amount must be greater than zero")
+		badRequest(w, "invalid_amount", "amount must be greater than zero")
 	case errors.Is(err, transferservice.ErrInvalidCurrency):
-		writeError(w, http.StatusBadRequest, "invalid_currency", "currency must be USD, EUR, or JPY")
+		badRequest(w, "invalid_currency", "currency must be USD, EUR, or JPY")
 	case errors.Is(err, transferservice.ErrSameWallet):
-		writeError(w, http.StatusBadRequest, "invalid_transfer", "source and destination wallets must differ")
+		badRequest(w, "invalid_transfer", "source and destination wallets must differ")
 	case errors.Is(err, transferservice.ErrInvalidWalletID):
-		writeError(w, http.StatusBadRequest, "invalid_wallet_id", "source and destination wallet IDs are required")
+		badRequest(w, "invalid_wallet_id", "source and destination wallet IDs are required")
 	case errors.Is(err, transferservice.ErrInvalidIdempotencyKey):
-		writeError(w, http.StatusBadRequest, "invalid_idempotency_key", "a valid Idempotency-Key header is required")
+		badRequest(w, "invalid_idempotency_key", "a valid Idempotency-Key header is required")
 	case errors.Is(err, transferservice.ErrNotFound):
-		writeError(w, http.StatusNotFound, "wallet_not_found", "wallet was not found")
+		walletNotFound(w)
 	case errors.Is(err, transferservice.ErrCurrencyMismatch):
-		writeError(w, http.StatusBadRequest, "currency_mismatch", "both wallets must use the requested currency")
+		badRequest(w, "currency_mismatch", "both wallets must use the requested currency")
 	case errors.Is(err, transferservice.ErrInsufficientFunds):
-		writeError(w, http.StatusUnprocessableEntity, "insufficient_funds", "source wallet has insufficient funds")
+		unprocessable(w, "insufficient_funds", "source wallet has insufficient funds")
 	case errors.Is(err, transferservice.ErrBalanceLimit):
-		writeError(w, http.StatusUnprocessableEntity, "balance_limit", "destination wallet balance limit would be exceeded")
+		unprocessable(w, "balance_limit", "destination wallet balance limit would be exceeded")
 	case errors.Is(err, transferservice.ErrIdempotencyConflict):
-		writeError(w, http.StatusConflict, "idempotency_conflict", "idempotency key was used for a different request")
+		conflict(w, "idempotency_conflict", "idempotency key was used for a different request")
 	default:
-		h.logger.Error("transfer failed", slog.Any("error", err))
-		writeError(w, http.StatusInternalServerError, "internal_error", "request could not be completed")
+		h.logger.ErrorContext(ctx, "transfer failed", slog.Any("error", err))
+		internalError(w)
 	}
 }
 

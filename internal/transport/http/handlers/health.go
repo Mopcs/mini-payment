@@ -36,12 +36,14 @@ func (h *Health) ready(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 
 	if err := h.postgres.Ping(ctx); err != nil {
-		h.logger.Error("readiness check failed", slog.String("dependency", "postgres"), slog.Any("error", err))
+		h.logger.ErrorContext(ctx, "readiness check failed",
+			slog.String("dependency", "postgres"), slog.Any("error", err))
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"status": "unavailable"})
 		return
 	}
 	if err := h.redis.Ping(ctx); err != nil {
-		h.logger.Error("readiness check failed", slog.String("dependency", "redis"), slog.Any("error", err))
+		h.logger.ErrorContext(ctx, "readiness check failed",
+			slog.String("dependency", "redis"), slog.Any("error", err))
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"status": "unavailable"})
 		return
 	}

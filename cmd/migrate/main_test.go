@@ -21,6 +21,7 @@ func TestPostgresURLEncodesCredentials(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parse generated database URL: %v", err)
 	}
+
 	username := parsedURL.User.Username()
 	password, ok := parsedURL.User.Password()
 	if username != "payment user" || !ok || password != "p@ss:/?#%word" {

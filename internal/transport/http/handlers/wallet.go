@@ -68,20 +68,23 @@ func (h *Wallet) Register(mux *http.ServeMux, tokens middleware.TokenValidator) 
 	mux.Handle("GET /api/v1/wallets", middleware.Authenticate(tokens, http.HandlerFunc(h.list)))
 	mux.Handle("GET /api/v1/wallets/{id}", middleware.Authenticate(tokens, http.HandlerFunc(h.get)))
 	mux.Handle("POST /api/v1/wallets", middleware.Authenticate(tokens, http.HandlerFunc(h.create)))
-	mux.Handle("POST /api/v1/wallets/{id}/deposits", middleware.Authenticate(tokens, http.HandlerFunc(h.deposit)))
+	mux.Handle(
+		"POST /api/v1/wallets/{id}/deposits",
+		middleware.Authenticate(tokens, http.HandlerFunc(h.deposit)),
+	)
 }
 
 func (h *Wallet) list(w http.ResponseWriter, r *http.Request) {
 	userID, ok := middleware.UserID(r.Context())
 	if !ok {
-		writeError(w, http.StatusUnauthorized, "unauthorized", "authentication required")
+		unauthorized(w)
 		return
 	}
 
 	wallets, err := h.service.List(r.Context(), userID)
 	if err != nil {
-		h.logger.Error("list wallets failed", slog.Any("error", err))
-		writeError(w, http.StatusInternalServerError, "internal_error", "request could not be completed")
+		h.logger.ErrorContext(r.Context(), "list wallets failed", slog.Any("error", err))
+		internalError(w)
 		return
 	}
 
@@ -95,7 +98,7 @@ func (h *Wallet) list(w http.ResponseWriter, r *http.Request) {
 func (h *Wallet) get(w http.ResponseWriter, r *http.Request) {
 	userID, ok := middleware.UserID(r.Context())
 	if !ok {
-		writeError(w, http.StatusUnauthorized, "unauthorized", "authentication required")
+		unauthorized(w)
 		return
 	}
 
@@ -106,12 +109,12 @@ func (h *Wallet) get(w http.ResponseWriter, r *http.Request) {
 
 	item, err := h.service.Get(r.Context(), userID, walletID)
 	if errors.Is(err, walletservice.ErrNotFound) {
-		writeError(w, http.StatusNotFound, "wallet_not_found", "wallet was not found")
+		walletNotFound(w)
 		return
 	}
 	if err != nil {
-		h.logger.Error("get wallet failed", slog.Any("error", err))
-		writeError(w, http.StatusInternalServerError, "internal_error", "request could not be completed")
+		h.logger.ErrorContext(r.Context(), "get wallet failed", slog.Any("error", err))
+		internalError(w)
 		return
 	}
 
@@ -121,7 +124,7 @@ func (h *Wallet) get(w http.ResponseWriter, r *http.Request) {
 func (h *Wallet) create(w http.ResponseWriter, r *http.Request) {
 	userID, ok := middleware.UserID(r.Context())
 	if !ok {
-		writeError(w, http.StatusUnauthorized, "unauthorized", "authentication required")
+		unauthorized(w)
 		return
 	}
 
@@ -133,7 +136,7 @@ func (h *Wallet) create(w http.ResponseWriter, r *http.Request) {
 
 	item, err := h.service.Create(r.Context(), userID, domain.NormalizeCurrency(request.Currency))
 	if err != nil {
-		h.writeCreateWalletError(w, err)
+		h.writeCreateWalletError(r.Context(), w, err)
 		return
 	}
 
@@ -143,7 +146,7 @@ func (h *Wallet) create(w http.ResponseWriter, r *http.Request) {
 func (h *Wallet) deposit(w http.ResponseWriter, r *http.Request) {
 	userID, ok := middleware.UserID(r.Context())
 	if !ok {
-		writeError(w, http.StatusUnauthorized, "unauthorized", "authentication required")
+		unauthorized(w)
 		return
 	}
 
@@ -164,7 +167,7 @@ func (h *Wallet) deposit(w http.ResponseWriter, r *http.Request) {
 		r.Header.Get("Idempotency-Key"),
 	)
 	if err != nil {
-		h.writeDepositError(w, err)
+		h.writeDepositError(r.Context(), w, err)
 		return
 	}
 
@@ -183,38 +186,46 @@ func (h *Wallet) deposit(w http.ResponseWriter, r *http.Request) {
 }
 
 // writeCreateWalletError maps service errors to the API error contract.
-func (h *Wallet) writeCreateWalletError(w http.ResponseWriter, err error) {
+func (h *Wallet) writeCreateWalletError(
+	ctx context.Context,
+	w http.ResponseWriter,
+	err error,
+) {
 	switch {
 	case errors.Is(err, walletservice.ErrInvalidCurrency):
-		writeError(w, http.StatusBadRequest, "invalid_currency", "currency must be USD, EUR, or JPY")
+		badRequest(w, "invalid_currency", "currency must be USD, EUR, or JPY")
 	case errors.Is(err, walletservice.ErrAlreadyExists):
-		writeError(w, http.StatusConflict, "wallet_already_exists", "wallet already exists for this currency")
+		conflict(w, "wallet_already_exists", "wallet already exists for this currency")
 	default:
-		h.logger.Error("create wallet failed", slog.Any("error", err))
-		writeError(w, http.StatusInternalServerError, "internal_error", "request could not be completed")
+		h.logger.ErrorContext(ctx, "create wallet failed", slog.Any("error", err))
+		internalError(w)
 	}
 }
 
 // writeDepositError maps service errors to the API error contract.
-func (h *Wallet) writeDepositError(w http.ResponseWriter, err error) {
+func (h *Wallet) writeDepositError(
+	ctx context.Context,
+	w http.ResponseWriter,
+	err error,
+) {
 	switch {
 	case errors.Is(err, walletservice.ErrInvalidAmount):
-		writeError(w, http.StatusBadRequest, "invalid_amount", "amount must be greater than zero")
+		badRequest(w, "invalid_amount", "amount must be greater than zero")
 	case errors.Is(err, walletservice.ErrInvalidCurrency):
-		writeError(w, http.StatusBadRequest, "invalid_currency", "currency must be USD, EUR, or JPY")
+		badRequest(w, "invalid_currency", "currency must be USD, EUR, or JPY")
 	case errors.Is(err, walletservice.ErrInvalidIdempotencyKey):
-		writeError(w, http.StatusBadRequest, "invalid_idempotency_key", "a valid Idempotency-Key header is required")
+		badRequest(w, "invalid_idempotency_key", "a valid Idempotency-Key header is required")
 	case errors.Is(err, walletservice.ErrCurrencyMismatch):
-		writeError(w, http.StatusBadRequest, "currency_mismatch", "currency does not match wallet")
+		badRequest(w, "currency_mismatch", "currency does not match wallet")
 	case errors.Is(err, walletservice.ErrNotFound):
-		writeError(w, http.StatusNotFound, "wallet_not_found", "wallet was not found")
+		walletNotFound(w)
 	case errors.Is(err, walletservice.ErrIdempotencyConflict):
-		writeError(w, http.StatusConflict, "idempotency_conflict", "idempotency key was used for a different request")
+		conflict(w, "idempotency_conflict", "idempotency key was used for a different request")
 	case errors.Is(err, walletservice.ErrBalanceLimit):
-		writeError(w, http.StatusConflict, "balance_limit", "deposit would exceed the wallet balance limit")
+		conflict(w, "balance_limit", "deposit would exceed the wallet balance limit")
 	default:
-		h.logger.Error("deposit failed", slog.Any("error", err))
-		writeError(w, http.StatusInternalServerError, "internal_error", "request could not be completed")
+		h.logger.ErrorContext(ctx, "deposit failed", slog.Any("error", err))
+		internalError(w)
 	}
 }
 
@@ -223,7 +234,7 @@ func (h *Wallet) writeDepositError(w http.ResponseWriter, err error) {
 func parseWalletID(w http.ResponseWriter, r *http.Request) (uuid.UUID, bool) {
 	walletID, err := uuid.Parse(r.PathValue("id"))
 	if err != nil || walletID == uuid.Nil {
-		writeError(w, http.StatusNotFound, "wallet_not_found", "wallet was not found")
+		walletNotFound(w)
 		return uuid.Nil, false
 	}
 	return walletID, true
@@ -231,7 +242,13 @@ func parseWalletID(w http.ResponseWriter, r *http.Request) (uuid.UUID, bool) {
 
 // decodeJSONRequest reads exactly one JSON value of the given shape, rejecting
 // unknown fields and trailing data.
-func decodeJSONRequest(w http.ResponseWriter, r *http.Request, target any, requestName string, maxBytes int64) *requestDecodeError {
+func decodeJSONRequest(
+	w http.ResponseWriter,
+	r *http.Request,
+	target any,
+	requestName string,
+	maxBytes int64,
+) *requestDecodeError {
 	contentType, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
 	if err != nil || contentType != "application/json" {
 		return &requestDecodeError{

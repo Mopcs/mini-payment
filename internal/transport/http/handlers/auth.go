@@ -69,7 +69,7 @@ func (h *Auth) register(w http.ResponseWriter, r *http.Request) {
 
 	result, err := h.service.Register(r.Context(), request.Email, request.Password)
 	if err != nil {
-		h.writeRegisterError(w, err)
+		h.writeRegisterError(r.Context(), w, err)
 		return
 	}
 
@@ -89,8 +89,8 @@ func (h *Auth) login(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusUnauthorized, "invalid_credentials", "invalid email or password")
 			return
 		}
-		h.logger.Error("login failed", slog.Any("error", err))
-		writeError(w, http.StatusInternalServerError, "internal_error", "request could not be completed")
+		h.logger.ErrorContext(r.Context(), "login failed", slog.Any("error", err))
+		internalError(w)
 		return
 	}
 
@@ -98,17 +98,21 @@ func (h *Auth) login(w http.ResponseWriter, r *http.Request) {
 }
 
 // writeRegisterError maps registration errors to the API error contract.
-func (h *Auth) writeRegisterError(w http.ResponseWriter, err error) {
+func (h *Auth) writeRegisterError(
+	ctx context.Context,
+	w http.ResponseWriter,
+	err error,
+) {
 	switch {
 	case errors.Is(err, authservice.ErrInvalidEmail):
-		writeError(w, http.StatusBadRequest, "invalid_email", "email address is invalid")
+		badRequest(w, "invalid_email", "email address is invalid")
 	case errors.Is(err, authservice.ErrInvalidPassword):
-		writeError(w, http.StatusBadRequest, "invalid_password", "password does not meet the length requirements")
+		badRequest(w, "invalid_password", "password does not meet the length requirements")
 	case errors.Is(err, authservice.ErrEmailAlreadyRegistered):
-		writeError(w, http.StatusConflict, "email_already_registered", "email is already registered")
+		conflict(w, "email_already_registered", "email is already registered")
 	default:
-		h.logger.Error("registration failed", slog.Any("error", err))
-		writeError(w, http.StatusInternalServerError, "internal_error", "request could not be completed")
+		h.logger.ErrorContext(ctx, "registration failed", slog.Any("error", err))
+		internalError(w)
 	}
 }
 
