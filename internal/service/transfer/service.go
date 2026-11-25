@@ -12,6 +12,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/Mopcs/mini-payment-system/internal/domain"
+	"github.com/Mopcs/mini-payment-system/internal/observability"
 	"github.com/Mopcs/mini-payment-system/internal/repository/postgres"
 )
 
@@ -45,9 +46,12 @@ func (s *Service) Transfer(
 	amount int64,
 	currency, idempotencyKey string,
 ) (domain.Transfer, bool, error) {
+	ctx, span := observability.Tracer().Start(ctx, "transfer.validate")
 	currency, idempotencyKey, err := validateTransfer(
 		sourceWalletID, destinationWalletID, amount, currency, idempotencyKey,
 	)
+	observability.RecordError(span, err)
+	span.End()
 	if err != nil {
 		return domain.Transfer{}, false, err
 	}

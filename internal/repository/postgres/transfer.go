@@ -15,6 +15,7 @@ import (
 
 	"github.com/Mopcs/mini-payment-system/internal/dbutil"
 	"github.com/Mopcs/mini-payment-system/internal/domain"
+	"github.com/Mopcs/mini-payment-system/internal/observability"
 )
 
 // TransferRequest carries one validated transfer attempt.
@@ -184,6 +185,12 @@ func (r *TransferRepository) Create(
 	ctx context.Context,
 	request TransferRequest,
 ) (result domain.Transfer, replay bool, returnedErr error) {
+	ctx, span := observability.Tracer().Start(ctx, "transfer.create")
+	defer func() {
+		observability.RecordError(span, returnedErr)
+		span.End()
+	}()
+
 	tx, err := r.pool.Begin(ctx)
 	if err != nil {
 		return domain.Transfer{}, false, fmt.Errorf("begin transfer transaction: %w", err)
@@ -203,7 +210,25 @@ func (r *TransferRepository) Create(
 		return domain.Transfer{}, false, err
 	}
 
-	result = domain.Transfer{
+	result = transferResult(transactionID, request, balances, createdAt)
+
+	if err := r.recordCompleted(ctx, tx, result); err != nil {
+		return domain.Transfer{}, false, err
+	}
+
+	if err := commitTransfer(ctx, tx); err != nil {
+		return domain.Transfer{}, false, translateError("commit transfer transaction", err)
+	}
+	return result, false, nil
+}
+
+func transferResult(
+	transactionID uuid.UUID,
+	request TransferRequest,
+	balances transferBalances,
+	createdAt time.Time,
+) domain.Transfer {
+	return domain.Transfer{
 		TransactionID:           transactionID,
 		SourceWalletID:          request.SourceID,
 		DestinationWalletID:     request.DestinationID,
@@ -213,15 +238,15 @@ func (r *TransferRepository) Create(
 		DestinationBalanceAfter: balances.destination,
 		CreatedAt:               createdAt,
 	}
+}
 
-	if err := r.recordCompleted(ctx, tx, result); err != nil {
-		return domain.Transfer{}, false, err
-	}
+func commitTransfer(ctx context.Context, tx pgx.Tx) error {
+	commitCtx, span := observability.Tracer().Start(ctx, "transfer.commit")
+	defer span.End()
 
-	if err := tx.Commit(ctx); err != nil {
-		return domain.Transfer{}, false, translateError("commit transfer transaction", err)
-	}
-	return result, false, nil
+	err := tx.Commit(commitCtx)
+	observability.RecordError(span, err)
+	return err
 }
 
 func claimTransfer(
@@ -229,6 +254,9 @@ func claimTransfer(
 	tx pgx.Tx,
 	request TransferRequest,
 ) (uuid.UUID, time.Time, bool, error) {
+	ctx, span := observability.Tracer().Start(ctx, "transfer.claim_idempotency")
+	defer span.End()
+
 	destinationID := request.DestinationID
 	transactionID, createdAt, replay, err := claimLedgerTransaction(ctx, tx, ledgerTransaction{
 		id:                  uuid.New(),
@@ -242,6 +270,7 @@ func claimTransfer(
 		amount:              request.Amount,
 	})
 	if err != nil {
+		observability.RecordError(span, err)
 		return uuid.Nil, time.Time{}, false,
 			fmt.Errorf("claim transfer idempotency key: %w", err)
 	}
@@ -343,6 +372,9 @@ func lockTransferWallets(
 	tx pgx.Tx,
 	plan transferPlan,
 ) (lockedTransferWallet, lockedTransferWallet, error) {
+	ctx, span := observability.Tracer().Start(ctx, "transfer.lock_wallets")
+	defer span.End()
+
 	first, second := plan.sourceID, plan.destinationID
 	if bytes.Compare(first[:], second[:]) > 0 {
 		first, second = second, first
@@ -352,6 +384,7 @@ func lockTransferWallets(
 	for _, walletID := range []uuid.UUID{first, second} {
 		wallet, found, err := lockTransferWallet(ctx, tx, walletID)
 		if err != nil {
+			observability.RecordError(span, err)
 			return lockedTransferWallet{}, lockedTransferWallet{}, err
 		}
 		if found {
@@ -364,6 +397,7 @@ func lockTransferWallets(
 
 	err := checkTransferAllowed(plan, source, destination, sourceExists, destinationExists)
 	if err != nil {
+		observability.RecordError(span, err)
 		return lockedTransferWallet{}, lockedTransferWallet{}, err
 	}
 	return source, destination, nil
@@ -463,13 +497,18 @@ func moveTransferBalances(
 	source, destination lockedTransferWallet,
 	balances transferBalances,
 ) error {
+	ctx, span := observability.Tracer().Start(ctx, "transfer.update_balances")
+	defer span.End()
+
 	err := updateWalletBalance(ctx, tx, plan.sourceID, source.balance, balances.source)
 	if err != nil {
+		observability.RecordError(span, err)
 		return fmt.Errorf("debit transfer source: %w", err)
 	}
 
 	err = updateWalletBalance(ctx, tx, plan.destinationID, destination.balance, balances.destination)
 	if err != nil {
+		observability.RecordError(span, err)
 		return fmt.Errorf("credit transfer destination: %w", err)
 	}
 	return nil
@@ -501,12 +540,16 @@ func writeTransferEntries(
 	plan transferPlan,
 	sourceAccountID, destinationAccountID uuid.UUID,
 ) error {
+	ctx, span := observability.Tracer().Start(ctx, "transfer.write_ledger_entries")
+	defer span.End()
+
 	_, err := tx.Exec(ctx, `
 		INSERT INTO ledger_entries (transaction_id, account_id, amount)
 		VALUES ($1, $2, $3), ($1, $4, $5)`,
 		transactionID, sourceAccountID, -plan.amount, destinationAccountID, plan.amount,
 	)
 	if err != nil {
+		observability.RecordError(span, err)
 		return translateError("write transfer ledger entries", err)
 	}
 	return nil

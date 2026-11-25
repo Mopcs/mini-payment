@@ -13,6 +13,7 @@ import (
 
 	"github.com/Mopcs/mini-payment-system/internal/dbutil"
 	"github.com/Mopcs/mini-payment-system/internal/domain"
+	"github.com/Mopcs/mini-payment-system/internal/observability"
 )
 
 var ErrInvalidTransferEvent = errors.New("invalid transfer event")
@@ -32,6 +33,12 @@ func (r *NotificationRepository) ProcessTransferCompleted(
 	eventType string,
 	payload domain.TransferCompletedPayload,
 ) (duplicate bool, returnedErr error) {
+	ctx, span := observability.Tracer().Start(ctx, "notification.record")
+	defer func() {
+		observability.RecordError(span, returnedErr)
+		span.End()
+	}()
+
 	tx, err := r.pool.Begin(ctx)
 	if err != nil {
 		return false, fmt.Errorf("begin event transaction: %w", err)

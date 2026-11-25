@@ -4,6 +4,7 @@ import (
 	"context"
 	"time"
 
+	"github.com/exaring/otelpgx"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/Mopcs/mini-payment-system/internal/config"
@@ -25,6 +26,12 @@ func NewPool(ctx context.Context, cfg config.Config) (*pgxpool.Pool, error) {
 	poolConfig.MinConns = 1
 	poolConfig.MaxConnLifetime = time.Hour
 	poolConfig.MaxConnIdleTime = 30 * time.Minute
+
+	// The tracer reads the statement text but never the bind parameters, so
+	// wallet identifiers and amounts stay out of the spans.
+	if cfg.TracingEnabled {
+		poolConfig.ConnConfig.Tracer = otelpgx.NewTracer()
+	}
 
 	return pgxpool.NewWithConfig(ctx, poolConfig)
 }
