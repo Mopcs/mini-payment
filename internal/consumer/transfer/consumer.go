@@ -15,6 +15,10 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/rabbitmq/amqp091-go"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	semconv "go.opentelemetry.io/otel/semconv/v1.43.0"
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/Mopcs/mini-payment-system/internal/domain"
 	"github.com/Mopcs/mini-payment-system/internal/observability"
@@ -328,6 +332,33 @@ func bindQueues(ch *amqp091.Channel, bindings []queueBinding) error {
 	return nil
 }
 
+// startConsumeSpan opens the consumer span and links it to the producer trace.
+// A link keeps the spans related without stretching the producer span across the
+// time the message waited in the queue.
+func startConsumeSpan(
+	ctx context.Context,
+	delivery amqp091.Delivery,
+	eventID uuid.UUID,
+	eventType string,
+) (context.Context, trace.Span) {
+	producer := otel.GetTextMapPropagator().Extract(
+		ctx, observability.AMQPHeaders(delivery.Headers),
+	)
+	options := []trace.SpanStartOption{
+		trace.WithSpanKind(trace.SpanKindConsumer),
+		trace.WithAttributes(
+			semconv.MessagingSystemKey.String("rabbitmq"),
+			semconv.MessagingOperationNameKey.String("process"),
+			semconv.MessagingMessageIDKey.String(eventID.String()),
+			attribute.String("consumer.event_type", eventType),
+		),
+	}
+	if producerSpan := trace.SpanContextFromContext(producer); producerSpan.IsValid() {
+		options = append(options, trace.WithLinks(trace.Link{SpanContext: producerSpan}))
+	}
+	return observability.Tracer().Start(ctx, "consumer.process", options...)
+}
+
 // handle processes one delivery and always leaves it either acked or untouched,
 // so a failed forward keeps the original message on the queue.
 func (c *Consumer) handle(
@@ -338,18 +369,27 @@ func (c *Consumer) handle(
 	eventID, _ := uuid.Parse(delivery.MessageId)
 	eventType, _ := delivery.Headers["event_type"].(string)
 
+	ctx, span := startConsumeSpan(ctx, delivery, eventID, eventType)
+	defer span.End()
+
 	c.metrics.RecordDelivery()
 	started := time.Now()
 	duplicate, err := c.processor.Process(ctx, eventID, eventType, delivery.Body)
 	c.metrics.RecordProcessing(time.Since(started), duplicate, err)
 
 	if err == nil {
-		c.logger.Info("event processed",
+		span.SetAttributes(
+			attribute.Bool("consumer.duplicate", duplicate),
+			attribute.String("consumer.settle", "ack"),
+		)
+		c.logger.InfoContext(ctx, "event processed",
 			slog.String("event_id", eventID.String()),
 			slog.String("event_type", eventType))
 		// Process returns only after the notification transaction commits.
 		return delivery.Ack(false)
 	}
+
+	observability.RecordError(span, err)
 	return c.handleFailure(ctx, delivery, publisher, deliveryFailure{
 		eventID:   eventID,
 		eventType: eventType,
@@ -386,7 +426,9 @@ func (c *Consumer) deadLetter(
 	publisher publisher,
 	failure deliveryFailure,
 ) error {
-	c.logger.Warn("event sent to dead-letter queue",
+	trace.SpanFromContext(ctx).SetAttributes(attribute.String("consumer.settle", "dead_letter"))
+
+	c.logger.WarnContext(ctx, "event sent to dead-letter queue",
 		slog.String("event_id", failure.eventID.String()),
 		slog.String("event_type", failure.eventType),
 		slog.String("reason", failure.reason))
@@ -426,7 +468,9 @@ func (c *Consumer) scheduleRetry(
 		return fmt.Errorf("publish retry: %w", err)
 	}
 
-	c.logger.Warn("event retry scheduled",
+	trace.SpanFromContext(ctx).SetAttributes(attribute.String("consumer.settle", "retry"))
+
+	c.logger.WarnContext(ctx, "event retry scheduled",
 		slog.String("event_id", failure.eventID.String()),
 		slog.Int("retry_count", failure.retryCount+1))
 	return delivery.Ack(false)
@@ -539,7 +583,13 @@ func (p *transferProcessor) Process(
 	eventID uuid.UUID,
 	eventType string,
 	body []byte,
-) (bool, error) {
+) (duplicate bool, returnedErr error) {
+	ctx, span := observability.Tracer().Start(ctx, "consumer.decode")
+	defer func() {
+		observability.RecordError(span, returnedErr)
+		span.End()
+	}()
+
 	if eventID == uuid.Nil {
 		return false, fmt.Errorf("%w: invalid message ID", ErrPermanent)
 	}
@@ -555,7 +605,7 @@ func (p *transferProcessor) Process(
 		return false, err
 	}
 
-	duplicate, err := p.repo.ProcessTransferCompleted(ctx, eventID, eventType, payload)
+	duplicate, err = p.repo.ProcessTransferCompleted(ctx, eventID, eventType, payload)
 	if errors.Is(err, postgres.ErrForeignKeyViolation) || errors.Is(err, postgres.ErrCheckViolation) {
 		return false, fmt.Errorf("%w: event conflicts with persisted records", ErrPermanent)
 	}
