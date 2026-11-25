@@ -14,6 +14,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/Mopcs/mini-payment-system/internal/domain"
+	"github.com/Mopcs/mini-payment-system/internal/observability"
 	transferservice "github.com/Mopcs/mini-payment-system/internal/service/transfer"
 	"github.com/Mopcs/mini-payment-system/internal/transport/http/middleware"
 )
@@ -41,6 +42,7 @@ type TransferService interface {
 type Transfers struct {
 	service TransferService
 	logger  *slog.Logger
+	auditor *observability.Auditor
 }
 
 type createTransferRequest struct {
@@ -69,13 +71,23 @@ type transferHistoryResponse struct {
 	Total  int64                        `json:"total"`
 }
 
-func NewTransfers(service TransferService, logger *slog.Logger) *Transfers {
-	return &Transfers{service: service, logger: logger}
+func NewTransfers(
+	service TransferService,
+	logger *slog.Logger,
+	auditor *observability.Auditor,
+) *Transfers {
+	return &Transfers{service: service, logger: logger, auditor: auditor}
 }
 
 func (h *Transfers) Register(mux *http.ServeMux, tokens middleware.TokenValidator) {
-	mux.Handle("POST /api/v1/transfers", middleware.Authenticate(tokens, http.HandlerFunc(h.create)))
-	mux.Handle("GET /api/v1/transfers", middleware.Authenticate(tokens, http.HandlerFunc(h.list)))
+	mux.Handle(
+		"POST /api/v1/transfers",
+		middleware.Authenticate(tokens, h.auditor, http.HandlerFunc(h.create)),
+	)
+	mux.Handle(
+		"GET /api/v1/transfers",
+		middleware.Authenticate(tokens, h.auditor, http.HandlerFunc(h.list)),
+	)
 }
 
 func (h *Transfers) list(w http.ResponseWriter, r *http.Request) {
@@ -154,30 +166,51 @@ func (h *Transfers) writeTransferError(
 	w http.ResponseWriter,
 	err error,
 ) {
+	failure := transferFailure(err)
+	if failure.status == http.StatusInternalServerError {
+		h.logger.ErrorContext(ctx, "transfer failed", slog.Any("error", err))
+	}
+	writeError(w, failure.status, failure.code, failure.message)
+
+	h.auditor.Event(ctx, "security.financial_request_rejected",
+		slog.String("operation", "transfer"),
+		slog.String("reason", failure.code))
+}
+
+// transferFailure is the single mapping from service error to response, so the
+// client answer and the audit reason can never disagree.
+func transferFailure(err error) apiFailure {
 	switch {
 	case errors.Is(err, transferservice.ErrInvalidAmount):
-		badRequest(w, "invalid_amount", "amount must be greater than zero")
+		return newFailure(http.StatusBadRequest, "invalid_amount", "amount must be greater than zero")
 	case errors.Is(err, transferservice.ErrInvalidCurrency):
-		badRequest(w, "invalid_currency", "currency must be USD, EUR, or JPY")
+		return newFailure(http.StatusBadRequest, "invalid_currency", "currency must be USD, EUR, or JPY")
 	case errors.Is(err, transferservice.ErrSameWallet):
-		badRequest(w, "invalid_transfer", "source and destination wallets must differ")
+		return newFailure(http.StatusBadRequest, "invalid_transfer",
+			"source and destination wallets must differ")
 	case errors.Is(err, transferservice.ErrInvalidWalletID):
-		badRequest(w, "invalid_wallet_id", "source and destination wallet IDs are required")
+		return newFailure(http.StatusBadRequest, "invalid_wallet_id",
+			"source and destination wallet IDs are required")
 	case errors.Is(err, transferservice.ErrInvalidIdempotencyKey):
-		badRequest(w, "invalid_idempotency_key", "a valid Idempotency-Key header is required")
+		return newFailure(http.StatusBadRequest, "invalid_idempotency_key",
+			"a valid Idempotency-Key header is required")
 	case errors.Is(err, transferservice.ErrNotFound):
-		walletNotFound(w)
+		return newFailure(http.StatusNotFound, "wallet_not_found", "wallet was not found")
 	case errors.Is(err, transferservice.ErrCurrencyMismatch):
-		badRequest(w, "currency_mismatch", "both wallets must use the requested currency")
+		return newFailure(http.StatusBadRequest, "currency_mismatch",
+			"both wallets must use the requested currency")
 	case errors.Is(err, transferservice.ErrInsufficientFunds):
-		unprocessable(w, "insufficient_funds", "source wallet has insufficient funds")
+		return newFailure(http.StatusUnprocessableEntity, "insufficient_funds",
+			"source wallet has insufficient funds")
 	case errors.Is(err, transferservice.ErrBalanceLimit):
-		unprocessable(w, "balance_limit", "destination wallet balance limit would be exceeded")
+		return newFailure(http.StatusUnprocessableEntity, "balance_limit",
+			"destination wallet balance limit would be exceeded")
 	case errors.Is(err, transferservice.ErrIdempotencyConflict):
-		conflict(w, "idempotency_conflict", "idempotency key was used for a different request")
+		return newFailure(http.StatusConflict, "idempotency_conflict",
+			"idempotency key was used for a different request")
 	default:
-		h.logger.ErrorContext(ctx, "transfer failed", slog.Any("error", err))
-		internalError(w)
+		return newFailure(http.StatusInternalServerError, "internal_error",
+			"request could not be completed")
 	}
 }
 

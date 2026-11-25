@@ -146,7 +146,7 @@ func TestTransferHistoryHandlerUsesAuthenticatedUser(t *testing.T) {
 	userID := uuid.New()
 	service := &transferServiceStub{items: []domain.TransferHistoryItem{}, total: 4}
 	mux := http.NewServeMux()
-	NewTransfers(service, slog.New(slog.NewTextHandler(io.Discard, nil))).Register(mux, tokenValidatorStub{userID: userID})
+	NewTransfers(service, slog.New(slog.NewTextHandler(io.Discard, nil)), nil).Register(mux, tokenValidatorStub{userID: userID})
 	request := httptest.NewRequest(http.MethodGet, "/api/v1/transfers?direction=outgoing&currency=usd", nil)
 	request.Header.Set("Authorization", "Bearer valid")
 	response := httptest.NewRecorder()
@@ -171,7 +171,7 @@ func TestTransferHistoryHandlerRejectsUnauthenticatedAndInvalidQuery(t *testing.
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			mux := http.NewServeMux()
-			NewTransfers(&transferServiceStub{}, slog.New(slog.NewTextHandler(io.Discard, nil))).Register(mux, test.token)
+			NewTransfers(&transferServiceStub{}, slog.New(slog.NewTextHandler(io.Discard, nil)), nil).Register(mux, test.token)
 			request := httptest.NewRequest(http.MethodGet, test.path, nil)
 			request.Header.Set("Authorization", "Bearer valid")
 			response := httptest.NewRecorder()
@@ -185,7 +185,7 @@ func TestTransferHistoryHandlerRejectsUnauthenticatedAndInvalidQuery(t *testing.
 
 func sendTransferRequest(service TransferService, tokens middleware.TokenValidator, body, authorization, key string) *httptest.ResponseRecorder {
 	mux := http.NewServeMux()
-	NewTransfers(service, slog.New(slog.NewTextHandler(io.Discard, nil))).Register(mux, tokens)
+	NewTransfers(service, slog.New(slog.NewTextHandler(io.Discard, nil)), nil).Register(mux, tokens)
 	request := httptest.NewRequest(http.MethodPost, "/api/v1/transfers", strings.NewReader(body))
 	request.Header.Set("Content-Type", "application/json")
 	request.Header.Set("Authorization", "Bearer "+authorization)

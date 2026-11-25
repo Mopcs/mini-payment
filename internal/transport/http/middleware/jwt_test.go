@@ -60,7 +60,7 @@ func TestAuthenticate(t *testing.T) {
 			if test.header != "" {
 				request.Header.Set("Authorization", test.header)
 			}
-			Authenticate(manager, next).ServeHTTP(recorder, request)
+			Authenticate(manager, nil, next).ServeHTTP(recorder, request)
 			if recorder.Code != test.status {
 				t.Fatalf("status = %d, want %d", recorder.Code, test.status)
 			}

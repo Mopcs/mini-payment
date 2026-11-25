@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/http"
 
+	"github.com/Mopcs/mini-payment-system/internal/observability"
 	authservice "github.com/Mopcs/mini-payment-system/internal/service/auth"
 )
 
@@ -20,6 +21,7 @@ type AuthService interface {
 type Auth struct {
 	service AuthService
 	logger  *slog.Logger
+	auditor *observability.Auditor
 }
 
 type credentialsRequest struct {
@@ -51,8 +53,8 @@ type requestDecodeError struct {
 
 func (e *requestDecodeError) Error() string { return e.text }
 
-func NewAuth(service AuthService, logger *slog.Logger) *Auth {
-	return &Auth{service: service, logger: logger}
+func NewAuth(service AuthService, logger *slog.Logger, auditor *observability.Auditor) *Auth {
+	return &Auth{service: service, logger: logger, auditor: auditor}
 }
 
 func (h *Auth) Register(mux *http.ServeMux) {
@@ -73,6 +75,8 @@ func (h *Auth) register(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	h.auditor.Event(r.Context(), "auth.register_succeeded",
+		slog.String("user_id", result.User.ID.String()))
 	writeAuthResponse(w, http.StatusCreated, result)
 }
 
@@ -86,14 +90,20 @@ func (h *Auth) login(w http.ResponseWriter, r *http.Request) {
 	result, err := h.service.Login(r.Context(), request.Email, request.Password)
 	if err != nil {
 		if errors.Is(err, authservice.ErrInvalidCredentials) {
+			h.auditor.Event(r.Context(), "auth.login_failed",
+				slog.String("reason", "invalid_credentials"))
 			writeError(w, http.StatusUnauthorized, "invalid_credentials", "invalid email or password")
 			return
 		}
 		h.logger.ErrorContext(r.Context(), "login failed", slog.Any("error", err))
+		h.auditor.Event(r.Context(), "auth.login_failed",
+			slog.String("reason", "internal_error"))
 		internalError(w)
 		return
 	}
 
+	h.auditor.Event(r.Context(), "auth.login_succeeded",
+		slog.String("user_id", result.User.ID.String()))
 	writeAuthResponse(w, http.StatusOK, result)
 }
 
@@ -103,17 +113,24 @@ func (h *Auth) writeRegisterError(
 	w http.ResponseWriter,
 	err error,
 ) {
+	reason := "internal_error"
 	switch {
 	case errors.Is(err, authservice.ErrInvalidEmail):
+		reason = "invalid_email"
 		badRequest(w, "invalid_email", "email address is invalid")
 	case errors.Is(err, authservice.ErrInvalidPassword):
+		reason = "invalid_password"
 		badRequest(w, "invalid_password", "password does not meet the length requirements")
 	case errors.Is(err, authservice.ErrEmailAlreadyRegistered):
+		reason = "email_already_registered"
 		conflict(w, "email_already_registered", "email is already registered")
 	default:
 		h.logger.ErrorContext(ctx, "registration failed", slog.Any("error", err))
 		internalError(w)
 	}
+
+	// The email itself is personal data and stays out of the audit trail.
+	h.auditor.Event(ctx, "auth.register_failed", slog.String("reason", reason))
 }
 
 func writeAuthResponse(w http.ResponseWriter, status int, result authservice.Result) {

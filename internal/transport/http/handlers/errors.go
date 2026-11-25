@@ -14,10 +14,6 @@ func conflict(w http.ResponseWriter, code, message string) {
 	writeError(w, http.StatusConflict, code, message)
 }
 
-func unprocessable(w http.ResponseWriter, code, message string) {
-	writeError(w, http.StatusUnprocessableEntity, code, message)
-}
-
 func unauthorized(w http.ResponseWriter) {
 	writeError(w, http.StatusUnauthorized, "unauthorized", "authentication required")
 }
@@ -28,4 +24,16 @@ func walletNotFound(w http.ResponseWriter) {
 
 func internalError(w http.ResponseWriter) {
 	writeError(w, http.StatusInternalServerError, "internal_error", "request could not be completed")
+}
+
+// apiFailure is a response decision taken before anything is written, so the
+// caller can log and audit using the same code it sends.
+type apiFailure struct {
+	status  int
+	code    string
+	message string
+}
+
+func newFailure(status int, code, message string) apiFailure {
+	return apiFailure{status: status, code: code, message: message}
 }

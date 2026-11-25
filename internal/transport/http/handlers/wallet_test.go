@@ -194,7 +194,7 @@ func sendDepositRequest(service WalletService, tokens middleware.TokenValidator,
 
 func sendWalletRequestWithKey(service WalletService, tokens middleware.TokenValidator, method, path, body, contentType, authorization, idempotencyKey string) *httptest.ResponseRecorder {
 	mux := http.NewServeMux()
-	NewWallet(service, slog.New(slog.NewTextHandler(io.Discard, nil))).Register(mux, tokens)
+	NewWallet(service, slog.New(slog.NewTextHandler(io.Discard, nil)), nil).Register(mux, tokens)
 	request := httptest.NewRequest(method, path, strings.NewReader(body))
 	request.Header.Set("Authorization", "Bearer "+authorization)
 	if idempotencyKey != "" {

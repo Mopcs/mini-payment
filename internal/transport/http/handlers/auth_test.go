@@ -114,7 +114,7 @@ func TestAuthHidesInternalErrors(t *testing.T) {
 func sendAuthRequest(service AuthService, path, body, contentType string) *httptest.ResponseRecorder {
 	mux := http.NewServeMux()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	NewAuth(service, logger).Register(mux)
+	NewAuth(service, logger, nil).Register(mux)
 	request := httptest.NewRequest(http.MethodPost, path, strings.NewReader(body))
 	if contentType != "" {
 		request.Header.Set("Content-Type", contentType)
@@ -122,4 +122,42 @@ func sendAuthRequest(service AuthService, path, body, contentType string) *httpt
 	response := httptest.NewRecorder()
 	mux.ServeHTTP(response, request)
 	return response
+}
+
+// A database error must never reach the client, only the generic envelope.
+func TestInternalErrorsDoNotLeakDetails(t *testing.T) {
+	service := &authServiceStub{
+		loginError: errors.New(`pq: relation "users" does not exist`),
+	}
+	response := sendAuthRequest(
+		service, "/api/v1/auth/login", `{"email":"user@example.com","password":"StrongPassword123!"}`, "application/json",
+	)
+
+	if response.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want %d", response.Code, http.StatusInternalServerError)
+	}
+	body := response.Body.String()
+	for _, leak := range []string{"pq:", "relation", "users", "sql"} {
+		if strings.Contains(body, leak) {
+			t.Fatalf("response leaked internal detail %q: %s", leak, body)
+		}
+	}
+	if !strings.Contains(body, "internal_error") {
+		t.Fatalf("response lost the stable error code: %s", body)
+	}
+}
+
+// The failure must not reveal whether the email exists.
+func TestLoginFailureIsGeneric(t *testing.T) {
+	service := &authServiceStub{loginError: authservice.ErrInvalidCredentials}
+	response := sendAuthRequest(
+		service, "/api/v1/auth/login", `{"email":"user@example.com","password":"StrongPassword123!"}`, "application/json",
+	)
+
+	if response.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want %d", response.Code, http.StatusUnauthorized)
+	}
+	if got := response.Body.String(); !strings.Contains(got, "invalid email or password") {
+		t.Fatalf("body = %s, want a generic message", got)
+	}
 }

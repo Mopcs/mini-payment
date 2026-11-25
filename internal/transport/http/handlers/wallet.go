@@ -13,6 +13,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/Mopcs/mini-payment-system/internal/domain"
+	"github.com/Mopcs/mini-payment-system/internal/observability"
 	walletservice "github.com/Mopcs/mini-payment-system/internal/service/wallet"
 	"github.com/Mopcs/mini-payment-system/internal/transport/http/middleware"
 )
@@ -29,6 +30,7 @@ type WalletService interface {
 type Wallet struct {
 	service WalletService
 	logger  *slog.Logger
+	auditor *observability.Auditor
 }
 
 type createWalletRequest struct {
@@ -60,17 +62,26 @@ type depositResponse struct {
 	CreatedAt     time.Time `json:"created_at"`
 }
 
-func NewWallet(service WalletService, logger *slog.Logger) *Wallet {
-	return &Wallet{service: service, logger: logger}
+func NewWallet(service WalletService, logger *slog.Logger, auditor *observability.Auditor) *Wallet {
+	return &Wallet{service: service, logger: logger, auditor: auditor}
 }
 
 func (h *Wallet) Register(mux *http.ServeMux, tokens middleware.TokenValidator) {
-	mux.Handle("GET /api/v1/wallets", middleware.Authenticate(tokens, http.HandlerFunc(h.list)))
-	mux.Handle("GET /api/v1/wallets/{id}", middleware.Authenticate(tokens, http.HandlerFunc(h.get)))
-	mux.Handle("POST /api/v1/wallets", middleware.Authenticate(tokens, http.HandlerFunc(h.create)))
+	mux.Handle(
+		"GET /api/v1/wallets",
+		middleware.Authenticate(tokens, h.auditor, http.HandlerFunc(h.list)),
+	)
+	mux.Handle(
+		"GET /api/v1/wallets/{id}",
+		middleware.Authenticate(tokens, h.auditor, http.HandlerFunc(h.get)),
+	)
+	mux.Handle(
+		"POST /api/v1/wallets",
+		middleware.Authenticate(tokens, h.auditor, http.HandlerFunc(h.create)),
+	)
 	mux.Handle(
 		"POST /api/v1/wallets/{id}/deposits",
-		middleware.Authenticate(tokens, http.HandlerFunc(h.deposit)),
+		middleware.Authenticate(tokens, h.auditor, http.HandlerFunc(h.deposit)),
 	)
 }
 
@@ -109,6 +120,9 @@ func (h *Wallet) get(w http.ResponseWriter, r *http.Request) {
 
 	item, err := h.service.Get(r.Context(), userID, walletID)
 	if errors.Is(err, walletservice.ErrNotFound) {
+		h.auditor.Event(r.Context(), "security.wallet_access_denied",
+			slog.String("wallet_id", walletID.String()),
+			slog.String("operation", "read"))
 		walletNotFound(w)
 		return
 	}
@@ -208,24 +222,41 @@ func (h *Wallet) writeDepositError(
 	w http.ResponseWriter,
 	err error,
 ) {
+	failure := depositFailure(err)
+	if failure.status == http.StatusInternalServerError {
+		h.logger.ErrorContext(ctx, "deposit failed", slog.Any("error", err))
+	}
+	writeError(w, failure.status, failure.code, failure.message)
+
+	// Amounts and idempotency keys stay out of the audit trail.
+	h.auditor.Event(ctx, "security.financial_request_rejected",
+		slog.String("operation", "deposit"),
+		slog.String("reason", failure.code))
+}
+
+// depositFailure is the single mapping from service error to response.
+func depositFailure(err error) apiFailure {
 	switch {
 	case errors.Is(err, walletservice.ErrInvalidAmount):
-		badRequest(w, "invalid_amount", "amount must be greater than zero")
+		return newFailure(http.StatusBadRequest, "invalid_amount", "amount must be greater than zero")
 	case errors.Is(err, walletservice.ErrInvalidCurrency):
-		badRequest(w, "invalid_currency", "currency must be USD, EUR, or JPY")
+		return newFailure(http.StatusBadRequest, "invalid_currency", "currency must be USD, EUR, or JPY")
 	case errors.Is(err, walletservice.ErrInvalidIdempotencyKey):
-		badRequest(w, "invalid_idempotency_key", "a valid Idempotency-Key header is required")
+		return newFailure(http.StatusBadRequest, "invalid_idempotency_key",
+			"a valid Idempotency-Key header is required")
 	case errors.Is(err, walletservice.ErrCurrencyMismatch):
-		badRequest(w, "currency_mismatch", "currency does not match wallet")
+		return newFailure(http.StatusBadRequest, "currency_mismatch", "currency does not match wallet")
 	case errors.Is(err, walletservice.ErrNotFound):
-		walletNotFound(w)
+		return newFailure(http.StatusNotFound, "wallet_not_found", "wallet was not found")
 	case errors.Is(err, walletservice.ErrIdempotencyConflict):
-		conflict(w, "idempotency_conflict", "idempotency key was used for a different request")
+		return newFailure(http.StatusConflict, "idempotency_conflict",
+			"idempotency key was used for a different request")
 	case errors.Is(err, walletservice.ErrBalanceLimit):
-		conflict(w, "balance_limit", "deposit would exceed the wallet balance limit")
+		return newFailure(http.StatusConflict, "balance_limit",
+			"deposit would exceed the wallet balance limit")
 	default:
-		h.logger.ErrorContext(ctx, "deposit failed", slog.Any("error", err))
-		internalError(w)
+		return newFailure(http.StatusInternalServerError, "internal_error",
+			"request could not be completed")
 	}
 }
 
