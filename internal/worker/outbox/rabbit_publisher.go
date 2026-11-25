@@ -9,8 +9,13 @@ import (
 	"sync"
 	"time"
 
-	"github.com/Mopcs/mini-payment-system/internal/domain"
 	"github.com/rabbitmq/amqp091-go"
+	"go.opentelemetry.io/otel"
+	semconv "go.opentelemetry.io/otel/semconv/v1.43.0"
+	"go.opentelemetry.io/otel/trace"
+
+	"github.com/Mopcs/mini-payment-system/internal/domain"
+	"github.com/Mopcs/mini-payment-system/internal/observability"
 )
 
 type RabbitSettings struct {
@@ -133,6 +138,17 @@ func (p *RabbitPublisher) send(
 ) error {
 	// mandatory=true asks the broker to return the message instead of dropping it
 	// when nothing is bound to the routing key.
+	headers := amqp091.Table{"event_type": event.EventType}
+	// W3C trace context rides in the headers, so the consumer can link its span
+	// back to the transfer that produced the event.
+	otel.GetTextMapPropagator().Inject(ctx, observability.AMQPHeaders(headers))
+
+	// The queue name is only known here, so the span the worker opened is
+	// enriched rather than duplicated.
+	trace.SpanFromContext(ctx).SetAttributes(
+		semconv.MessagingDestinationNameKey.String(p.settings.Queue),
+	)
+
 	err := p.channel.PublishWithContext(
 		ctx,
 		p.settings.Exchange,
@@ -143,7 +159,7 @@ func (p *RabbitPublisher) send(
 			ContentType:  "application/json",
 			DeliveryMode: amqp091.Persistent,
 			MessageId:    event.ID.String(),
-			Headers:      amqp091.Table{"event_type": event.EventType},
+			Headers:      headers,
 			Body:         body,
 		},
 	)

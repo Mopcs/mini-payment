@@ -8,6 +8,11 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/propagation"
+	semconv "go.opentelemetry.io/otel/semconv/v1.43.0"
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/Mopcs/mini-payment-system/internal/domain"
 	"github.com/Mopcs/mini-payment-system/internal/observability"
@@ -129,15 +134,14 @@ func (w *Worker) disconnect(publisher Publisher) {
 // processBatch publishes one claimed batch and reports whether the connection
 // looks broken.
 func (w *Worker) processBatch(ctx context.Context, publisher Publisher) (reconnect bool) {
-	events, err := w.repository.ClaimBatch(
-		ctx, w.workerID, w.settings.BatchSize, w.settings.LeaseDuration,
-	)
+	events, err := w.claimBatch(ctx)
 	if err != nil {
-		w.logger.Error("claim outbox events failed", slog.Any("error", err))
+		w.logger.ErrorContext(ctx, "claim outbox events failed", slog.Any("error", err))
 		return false
 	}
 
-	w.logger.Info(
+	w.logger.InfoContext(
+		ctx,
 		"claimed outbox events",
 		slog.Int("count", len(events)),
 		slog.String("worker_id", w.workerID.String()),
@@ -177,21 +181,68 @@ func (w *Worker) publishEvent(
 	w.metrics.StartJob()
 	defer w.metrics.FinishJob()
 
+	ctx, span := startPublishSpan(ctx, event)
+	defer span.End()
+
 	// Keep the lease alive while RabbitMQ confirms publication.
 	if err := w.repository.ExtendLease(
 		ctx, event.ID, w.workerID, w.settings.LeaseDuration,
 	); err != nil {
-		w.logger.Warn("outbox event lease is no longer owned",
+		observability.RecordError(span, err)
+		w.logger.WarnContext(ctx, "outbox event lease is no longer owned",
 			slog.String("event_id", event.ID.String()))
 		return false
 	}
 
 	if err := w.publish(ctx, publisher, event); err != nil {
+		observability.RecordError(span, err)
 		return w.schedulePublishRetry(ctx, event, err)
 	}
 	w.metrics.RecordPublished()
 
 	return w.markEventPublished(ctx, event)
+}
+
+func (w *Worker) claimBatch(ctx context.Context) ([]domain.OutboxEvent, error) {
+	ctx, span := observability.Tracer().Start(ctx, "outbox.claim")
+	defer span.End()
+
+	events, err := w.repository.ClaimBatch(
+		ctx, w.workerID, w.settings.BatchSize, w.settings.LeaseDuration,
+	)
+	observability.RecordError(span, err)
+	span.SetAttributes(attribute.Int("outbox.batch_size", len(events)))
+	return events, err
+}
+
+// startPublishSpan reattaches the event to the trace that produced it, so the
+// publish appears in the same trace as the transfer that queued it.
+func startPublishSpan(ctx context.Context, event domain.OutboxEvent) (context.Context, trace.Span) {
+	return observability.Tracer().Start(
+		eventContext(ctx, event),
+		"outbox.publish",
+		trace.WithSpanKind(trace.SpanKindProducer),
+		trace.WithAttributes(
+			semconv.MessagingSystemKey.String("rabbitmq"),
+			semconv.MessagingOperationNameKey.String("publish"),
+			semconv.MessagingMessageIDKey.String(event.ID.String()),
+			attribute.String("outbox.event_type", event.EventType),
+		),
+	)
+}
+
+// eventContext rebuilds the trace context stored with the row. The worker runs
+// in another process, so the API context cannot survive in memory.
+func eventContext(ctx context.Context, event domain.OutboxEvent) context.Context {
+	if event.TraceParent == "" {
+		return ctx
+	}
+
+	carrier := propagation.MapCarrier{"traceparent": event.TraceParent}
+	if event.TraceState != "" {
+		carrier["tracestate"] = event.TraceState
+	}
+	return otel.GetTextMapPropagator().Extract(ctx, carrier)
 }
 
 func (w *Worker) publish(ctx context.Context, publisher Publisher, event domain.OutboxEvent) error {
@@ -207,18 +258,22 @@ func (w *Worker) schedulePublishRetry(
 ) bool {
 	w.metrics.RecordPublishFailure()
 
+	ctx, span := observability.Tracer().Start(ctx, "outbox.schedule_retry")
+	defer span.End()
+
 	delay := RetryDelay(event.Attempts+1, w.settings.MaxBackoff)
 	if err := w.repository.ScheduleRetry(
 		ctx, event.ID, w.workerID, publishErr.Error(), delay,
 	); err != nil {
-		w.logger.Error("schedule outbox retry failed",
+		observability.RecordError(span, err)
+		w.logger.ErrorContext(ctx, "schedule outbox retry failed",
 			slog.String("event_id", event.ID.String()),
 			slog.Any("error", err))
 		return true
 	}
 	w.metrics.RecordRetry()
 
-	w.logger.Warn("outbox event publication failed",
+	w.logger.WarnContext(ctx, "outbox event publication failed",
 		slog.String("event_id", event.ID.String()),
 		slog.Int("attempt", event.Attempts+1),
 		slog.Duration("retry_after", delay))
@@ -226,14 +281,18 @@ func (w *Worker) schedulePublishRetry(
 }
 
 func (w *Worker) markEventPublished(ctx context.Context, event domain.OutboxEvent) bool {
+	ctx, span := observability.Tracer().Start(ctx, "outbox.mark_published")
+	defer span.End()
+
 	if err := w.repository.MarkPublished(ctx, event.ID, w.workerID); err != nil {
-		w.logger.Error("mark outbox event published failed",
+		observability.RecordError(span, err)
+		w.logger.ErrorContext(ctx, "mark outbox event published failed",
 			slog.String("event_id", event.ID.String()),
 			slog.Any("error", err))
 		return false
 	}
 
-	w.logger.Info("outbox event published",
+	w.logger.InfoContext(ctx, "outbox event published",
 		slog.String("event_id", event.ID.String()),
 		slog.String("event_type", event.EventType))
 	return false
