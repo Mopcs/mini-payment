@@ -32,7 +32,7 @@ func NewServer(config ServerConfig) *http.Server {
 
 	return &http.Server{
 		Addr:              config.Address,
-		Handler:           config.Metrics.Instrument(mux),
+		Handler:           middleware.Tracing(config.Metrics.Instrument(mux)),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 }
