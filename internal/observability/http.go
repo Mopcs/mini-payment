@@ -1,9 +1,6 @@
 package observability
 
 import (
-	"bufio"
-	"fmt"
-	"net"
 	"net/http"
 	"strconv"
 	"time"
@@ -45,7 +42,7 @@ func (m *HTTPMetrics) Instrument(next http.Handler) http.Handler {
 		}
 
 		started := time.Now()
-		response := &statusWriter{ResponseWriter: w, status: http.StatusOK}
+		response := NewStatusRecorder(w)
 		method := normalizeMethod(r.Method)
 		m.RequestsActive.WithLabelValues(method).Inc()
 		defer m.observeRequest(response, r, method, started)
@@ -67,14 +64,14 @@ func normalizeMethod(method string) string {
 // observeRequest runs deferred so it also sees a handler panic. The request is
 // recorded either way and the panic keeps travelling up the stack.
 func (m *HTTPMetrics) observeRequest(
-	response *statusWriter,
+	response *StatusRecorder,
 	request *http.Request,
 	method string,
 	started time.Time,
 ) {
 	recovered := recover()
-	if recovered != nil && !response.wroteHeader {
-		response.status = http.StatusInternalServerError
+	if recovered != nil {
+		response.Fail(http.StatusInternalServerError)
 	}
 
 	m.recordRequest(response, request, method, started)
@@ -84,7 +81,7 @@ func (m *HTTPMetrics) observeRequest(
 }
 
 func (m *HTTPMetrics) recordRequest(
-	response *statusWriter,
+	response *StatusRecorder,
 	request *http.Request,
 	method string,
 	started time.Time,
@@ -94,55 +91,8 @@ func (m *HTTPMetrics) recordRequest(
 		route = "unmatched"
 	}
 	m.RequestsActive.WithLabelValues(method).Dec()
-	status := strconv.Itoa(response.status)
+	status := strconv.Itoa(response.Status())
 	labels := []string{method, route, status}
 	m.RequestsTotal.WithLabelValues(labels...).Inc()
 	m.RequestDuration.WithLabelValues(labels...).Observe(time.Since(started).Seconds())
-}
-
-type statusWriter struct {
-	http.ResponseWriter
-	status      int
-	wroteHeader bool
-}
-
-func (w *statusWriter) WriteHeader(status int) {
-	if w.wroteHeader {
-		return
-	}
-	w.status = status
-	w.wroteHeader = true
-	w.ResponseWriter.WriteHeader(status)
-}
-
-func (w *statusWriter) Write(body []byte) (int, error) {
-	w.WriteHeader(http.StatusOK)
-	return w.ResponseWriter.Write(body)
-}
-
-func (w *statusWriter) Flush() {
-	w.WriteHeader(http.StatusOK)
-	if flusher, ok := w.ResponseWriter.(http.Flusher); ok {
-		flusher.Flush()
-	}
-}
-
-func (w *statusWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
-	hijacker, ok := w.ResponseWriter.(http.Hijacker)
-	if !ok {
-		return nil, nil, fmt.Errorf("response writer does not support hijacking")
-	}
-	return hijacker.Hijack()
-}
-
-func (w *statusWriter) Push(target string, options *http.PushOptions) error {
-	pusher, ok := w.ResponseWriter.(http.Pusher)
-	if !ok {
-		return http.ErrNotSupported
-	}
-	return pusher.Push(target, options)
-}
-
-func (w *statusWriter) Unwrap() http.ResponseWriter {
-	return w.ResponseWriter
 }
