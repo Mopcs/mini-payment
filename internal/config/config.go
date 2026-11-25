@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/netip"
 	"net/url"
 	"os"
 	"strconv"
@@ -61,6 +62,19 @@ type Config struct {
 	TracingInsecure              bool
 	TracingSampler               string
 	TracingSamplerArg            float64
+	AppEnv                       string
+	HTTPReadHeaderTimeout        time.Duration
+	HTTPReadTimeout              time.Duration
+	HTTPWriteTimeout             time.Duration
+	HTTPIdleTimeout              time.Duration
+	RateLimitEnabled             bool
+	RateLimitAuthLimit           int
+	RateLimitAuthWindow          time.Duration
+	RateLimitFinancialLimit      int
+	RateLimitFinancialWindow     time.Duration
+	TrustedProxies               []netip.Prefix
+	CORSAllowedOrigins           []string
+	CORSAllowCredentials         bool
 }
 
 // Load reads .env when it exists, then the environment, and validates every
@@ -79,6 +93,7 @@ func Load() (Config, error) {
 		RedisHost:    envOrDefault("REDIS_HOST", "localhost"),
 		LogLevel:     envOrDefault("LOG_LEVEL", "info"),
 		JWTIssuer:    strings.TrimSpace(envOrDefault("JWT_ISSUER", "mini-payment-system")),
+		AppEnv:       strings.ToLower(strings.TrimSpace(envOrDefault("APP_ENV", "development"))),
 	}
 
 	loaders := []func(*Config) error{
@@ -90,6 +105,9 @@ func Load() (Config, error) {
 		loadConsumer,
 		loadMetrics,
 		loadTracing,
+		loadHTTP,
+		loadRateLimit,
+		loadCORS,
 	}
 	for _, load := range loaders {
 		if err := load(&cfg); err != nil {
@@ -227,6 +245,148 @@ func traceEndpoint(value string) (string, bool, error) {
 	return parsed.Host, parsed.Scheme != "https", nil
 }
 
+const (
+	minHTTPTimeout = time.Second
+	maxHTTPTimeout = 5 * time.Minute
+)
+
+// loadHTTP reads the server timeouts. They are deliberately short: a client
+// that cannot send its headers within seconds is not a client this API serves.
+func loadHTTP(cfg *Config) error {
+	switch cfg.AppEnv {
+	case "development", "production", "test":
+	default:
+		return errors.New("APP_ENV must be development, production, or test")
+	}
+
+	timeouts := []struct {
+		key      string
+		fallback time.Duration
+		target   *time.Duration
+	}{
+		{"HTTP_READ_HEADER_TIMEOUT", 5 * time.Second, &cfg.HTTPReadHeaderTimeout},
+		{"HTTP_READ_TIMEOUT", 15 * time.Second, &cfg.HTTPReadTimeout},
+		{"HTTP_WRITE_TIMEOUT", 30 * time.Second, &cfg.HTTPWriteTimeout},
+		{"HTTP_IDLE_TIMEOUT", 60 * time.Second, &cfg.HTTPIdleTimeout},
+	}
+
+	for _, timeout := range timeouts {
+		value, err := durationFromEnv(timeout.key, timeout.fallback)
+		if err != nil || value < minHTTPTimeout || value > maxHTTPTimeout {
+			return fmt.Errorf("%s must be between 1s and 5m", timeout.key)
+		}
+		*timeout.target = value
+	}
+
+	// A read timeout below the header timeout would cut a client off while it
+	// is still sending headers.
+	if cfg.HTTPReadTimeout < cfg.HTTPReadHeaderTimeout {
+		return errors.New("HTTP_READ_TIMEOUT must not be shorter than HTTP_READ_HEADER_TIMEOUT")
+	}
+	return nil
+}
+
+// loadRateLimit reads the policies and the proxy list used to identify a
+// client. An empty TRUSTED_PROXIES means forwarded headers are ignored.
+func loadRateLimit(cfg *Config) error {
+	enabled, err := boolFromEnv("RATE_LIMIT_ENABLED", true)
+	if err != nil {
+		return err
+	}
+
+	authLimit, err := intFromEnv("RATE_LIMIT_AUTH_LIMIT", 10, 1, 100000)
+	if err != nil {
+		return err
+	}
+	authWindow, err := windowFromEnv("RATE_LIMIT_AUTH_WINDOW", time.Minute)
+	if err != nil {
+		return err
+	}
+	financialLimit, err := intFromEnv("RATE_LIMIT_FINANCIAL_LIMIT", 30, 1, 100000)
+	if err != nil {
+		return err
+	}
+	financialWindow, err := windowFromEnv("RATE_LIMIT_FINANCIAL_WINDOW", time.Minute)
+	if err != nil {
+		return err
+	}
+	proxies, err := parsePrefixes(envOrDefault("TRUSTED_PROXIES", ""))
+	if err != nil {
+		return err
+	}
+
+	cfg.RateLimitEnabled = enabled
+	cfg.RateLimitAuthLimit = authLimit
+	cfg.RateLimitAuthWindow = authWindow
+	cfg.RateLimitFinancialLimit = financialLimit
+	cfg.RateLimitFinancialWindow = financialWindow
+	cfg.TrustedProxies = proxies
+	return nil
+}
+
+// loadCORS keeps CORS off unless origins are listed explicitly.
+func loadCORS(cfg *Config) error {
+	origins := splitList(envOrDefault("CORS_ALLOWED_ORIGINS", ""))
+	credentials, err := boolFromEnv("CORS_ALLOW_CREDENTIALS", false)
+	if err != nil {
+		return err
+	}
+
+	for _, origin := range origins {
+		if origin == "*" {
+			if credentials {
+				return errors.New("CORS_ALLOWED_ORIGINS must not contain * when credentials are enabled")
+			}
+			continue
+		}
+		parsed, err := url.Parse(origin)
+		if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+			return errors.New("CORS_ALLOWED_ORIGINS must contain absolute origins")
+		}
+	}
+
+	cfg.CORSAllowedOrigins = origins
+	cfg.CORSAllowCredentials = credentials
+	return nil
+}
+
+func windowFromEnv(key string, fallback time.Duration) (time.Duration, error) {
+	value, err := durationFromEnv(key, fallback)
+	if err != nil || value < time.Second || value > time.Hour {
+		return 0, fmt.Errorf("%s must be between 1s and 1h", key)
+	}
+	return value, nil
+}
+
+func splitList(value string) []string {
+	parts := strings.Split(value, ",")
+	items := make([]string, 0, len(parts))
+	for _, part := range parts {
+		if trimmed := strings.TrimSpace(part); trimmed != "" {
+			items = append(items, trimmed)
+		}
+	}
+	return items
+}
+
+func parsePrefixes(value string) ([]netip.Prefix, error) {
+	items := splitList(value)
+	prefixes := make([]netip.Prefix, 0, len(items))
+
+	for _, item := range items {
+		if prefix, err := netip.ParsePrefix(item); err == nil {
+			prefixes = append(prefixes, prefix.Masked())
+			continue
+		}
+		address, err := netip.ParseAddr(item)
+		if err != nil {
+			return nil, errors.New("TRUSTED_PROXIES must contain IP addresses or CIDR ranges")
+		}
+		prefixes = append(prefixes, netip.PrefixFrom(address, address.BitLen()))
+	}
+	return prefixes, nil
+}
+
 // loadConnections validates the PostgreSQL and Redis endpoints.
 func loadConnections(cfg *Config) error {
 	postgresPort, err := portFromEnv("POSTGRES_PORT", "5432")
@@ -270,6 +430,9 @@ func loadAuth(cfg *Config) error {
 	}
 	if len([]byte(secret)) < minJWTSecretBytes {
 		return errors.New("JWT_SECRET must be at least 32 bytes")
+	}
+	if cfg.AppEnv == "production" && isPlaceholderSecret(secret) {
+		return errors.New("JWT_SECRET must not be a placeholder value in production")
 	}
 	if cfg.JWTIssuer == "" {
 		return errors.New("JWT_ISSUER must not be empty")
@@ -381,6 +544,20 @@ func loadConsumer(cfg *Config) error {
 	cfg.ConsumerPrefetchCount = prefetch
 	cfg.ConsumerReconnectInterval = reconnectInterval
 	return nil
+}
+
+// isPlaceholderSecret catches the values shipped in .env.example and the ones
+// people type by hand. A real secret is random and matches none of these.
+func isPlaceholderSecret(secret string) bool {
+	lowered := strings.ToLower(secret)
+	for _, marker := range []string{
+		"replace", "placeholder", "change", "example", "local_dev", "secret", "password", "your-",
+	} {
+		if strings.Contains(lowered, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 func envOrDefault(key, fallback string) string {

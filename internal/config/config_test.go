@@ -227,3 +227,140 @@ func environmentKeys() []string {
 		"OUTBOX_BATCH_SIZE", "OUTBOX_POLL_INTERVAL", "OUTBOX_LEASE_DURATION", "OUTBOX_MAX_BACKOFF",
 	}
 }
+
+func withRequiredSecrets(t *testing.T, jwtSecret string) {
+	t.Helper()
+
+	withCleanEnvironment(t)
+	t.Setenv("POSTGRES_PASSWORD", "postgres-test")
+	t.Setenv("REDIS_PASSWORD", "redis-test")
+	t.Setenv("JWT_SECRET", jwtSecret)
+}
+
+func TestLoadRejectsPlaceholderSecretInProduction(t *testing.T) {
+	withRequiredSecrets(t, "replace-this-placeholder-with-a-random-secret-of-at-least-32-bytes")
+	t.Setenv("APP_ENV", "production")
+
+	if _, err := Load(); err == nil {
+		t.Fatal("placeholder JWT secret was accepted in production")
+	}
+}
+
+func TestLoadAcceptsRandomSecretInProduction(t *testing.T) {
+	withRequiredSecrets(t, "9f2a7c1e5b8d3f6a0c4e7b1d9a2f5c8e4b7d1a3f")
+	t.Setenv("APP_ENV", "production")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.AppEnv != "production" {
+		t.Fatalf("AppEnv = %q, want production", cfg.AppEnv)
+	}
+}
+
+func TestLoadRejectsUnknownEnvironment(t *testing.T) {
+	withRequiredSecrets(t, "9f2a7c1e5b8d3f6a0c4e7b1d9a2f5c8e4b7d1a3f")
+	t.Setenv("APP_ENV", "staging")
+
+	if _, err := Load(); err == nil {
+		t.Fatal("unknown APP_ENV was accepted")
+	}
+}
+
+func TestLoadAppliesTimeoutDefaults(t *testing.T) {
+	withRequiredSecrets(t, "9f2a7c1e5b8d3f6a0c4e7b1d9a2f5c8e4b7d1a3f")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+
+	timeouts := []struct {
+		name string
+		got  time.Duration
+		want time.Duration
+	}{
+		{"HTTPReadHeaderTimeout", cfg.HTTPReadHeaderTimeout, 5 * time.Second},
+		{"HTTPReadTimeout", cfg.HTTPReadTimeout, 15 * time.Second},
+		{"HTTPWriteTimeout", cfg.HTTPWriteTimeout, 30 * time.Second},
+		{"HTTPIdleTimeout", cfg.HTTPIdleTimeout, 60 * time.Second},
+	}
+	for _, timeout := range timeouts {
+		if timeout.got != timeout.want {
+			t.Fatalf("%s = %v, want %v", timeout.name, timeout.got, timeout.want)
+		}
+	}
+}
+
+func TestLoadRejectsExcessiveTimeout(t *testing.T) {
+	withRequiredSecrets(t, "9f2a7c1e5b8d3f6a0c4e7b1d9a2f5c8e4b7d1a3f")
+	t.Setenv("HTTP_WRITE_TIMEOUT", "10m")
+
+	if _, err := Load(); err == nil {
+		t.Fatal("a ten minute write timeout was accepted")
+	}
+}
+
+func TestLoadRejectsReadTimeoutBelowHeaderTimeout(t *testing.T) {
+	withRequiredSecrets(t, "9f2a7c1e5b8d3f6a0c4e7b1d9a2f5c8e4b7d1a3f")
+	t.Setenv("HTTP_READ_HEADER_TIMEOUT", "10s")
+	t.Setenv("HTTP_READ_TIMEOUT", "5s")
+
+	if _, err := Load(); err == nil {
+		t.Fatal("read timeout shorter than the header timeout was accepted")
+	}
+}
+
+func TestLoadParsesTrustedProxies(t *testing.T) {
+	withRequiredSecrets(t, "9f2a7c1e5b8d3f6a0c4e7b1d9a2f5c8e4b7d1a3f")
+	t.Setenv("TRUSTED_PROXIES", "10.0.0.0/8, 192.168.1.5")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if len(cfg.TrustedProxies) != 2 {
+		t.Fatalf("TrustedProxies = %v, want two entries", cfg.TrustedProxies)
+	}
+}
+
+func TestLoadRejectsInvalidTrustedProxy(t *testing.T) {
+	withRequiredSecrets(t, "9f2a7c1e5b8d3f6a0c4e7b1d9a2f5c8e4b7d1a3f")
+	t.Setenv("TRUSTED_PROXIES", "not-an-address")
+
+	if _, err := Load(); err == nil {
+		t.Fatal("invalid TRUSTED_PROXIES entry was accepted")
+	}
+}
+
+func TestLoadRejectsWildcardCORSWithCredentials(t *testing.T) {
+	withRequiredSecrets(t, "9f2a7c1e5b8d3f6a0c4e7b1d9a2f5c8e4b7d1a3f")
+	t.Setenv("CORS_ALLOWED_ORIGINS", "*")
+	t.Setenv("CORS_ALLOW_CREDENTIALS", "true")
+
+	if _, err := Load(); err == nil {
+		t.Fatal("wildcard origin with credentials was accepted")
+	}
+}
+
+func TestLoadKeepsCORSDisabledByDefault(t *testing.T) {
+	withRequiredSecrets(t, "9f2a7c1e5b8d3f6a0c4e7b1d9a2f5c8e4b7d1a3f")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if len(cfg.CORSAllowedOrigins) != 0 {
+		t.Fatalf("CORSAllowedOrigins = %v, want none", cfg.CORSAllowedOrigins)
+	}
+}
+
+func TestLoadRejectsZeroRateLimit(t *testing.T) {
+	withRequiredSecrets(t, "9f2a7c1e5b8d3f6a0c4e7b1d9a2f5c8e4b7d1a3f")
+	t.Setenv("RATE_LIMIT_AUTH_LIMIT", "0")
+
+	if _, err := Load(); err == nil {
+		t.Fatal("a zero auth rate limit was accepted")
+	}
+}
