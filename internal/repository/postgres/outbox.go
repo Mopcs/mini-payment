@@ -11,8 +11,11 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/propagation"
 
 	"github.com/Mopcs/mini-payment-system/internal/domain"
+	"github.com/Mopcs/mini-payment-system/internal/observability"
 )
 
 type OutboxRepository struct {
@@ -26,14 +29,29 @@ func NewOutboxRepository(pool *pgxpool.Pool) *OutboxRepository {
 }
 
 func (r *OutboxRepository) Create(ctx context.Context, tx pgx.Tx, event domain.OutboxEvent) error {
+	ctx, span := observability.Tracer().Start(ctx, "outbox.enqueue")
+	defer span.End()
+
 	payload, err := json.Marshal(event.Payload)
 	if err != nil {
+		observability.RecordError(span, err)
 		return fmt.Errorf("marshal outbox event payload: %w", err)
 	}
-	if _, err := tx.Exec(ctx, `
-		INSERT INTO outbox_events (id, aggregate_id, aggregate_type, event_type, payload)
-		VALUES ($1, $2, $3, $4, $5::jsonb)`,
-		event.ID, event.AggregateID, event.AggregateType, event.EventType, string(payload)); err != nil {
+
+	// The trace context is persisted next to the row, because the worker runs in
+	// another process and cannot inherit the API's in-memory context.
+	carrier := propagation.MapCarrier{}
+	otel.GetTextMapPropagator().Inject(ctx, carrier)
+
+	_, err = tx.Exec(ctx, `
+		INSERT INTO outbox_events
+			(id, aggregate_id, aggregate_type, event_type, payload, trace_parent, trace_state)
+		VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7)`,
+		event.ID, event.AggregateID, event.AggregateType, event.EventType,
+		string(payload), carrier.Get("traceparent"), carrier.Get("tracestate"),
+	)
+	if err != nil {
+		observability.RecordError(span, err)
 		return translateError("create outbox event", err)
 	}
 	return nil
@@ -59,7 +77,8 @@ const claimOutboxEventsQuery = `
 	    locked_until = clock_timestamp() + ($3 * INTERVAL '1 microsecond')
 	FROM claimable AS c
 	WHERE e.id = c.id
-	RETURNING e.id, e.aggregate_id, e.aggregate_type, e.event_type, e.payload, e.attempts`
+	RETURNING e.id, e.aggregate_id, e.aggregate_type, e.event_type, e.payload, e.attempts,
+	          e.trace_parent, e.trace_state`
 
 // ClaimBatch locks a batch of due events for this worker. SKIP LOCKED lets
 // several workers pull from the same table without queueing behind each other.
@@ -130,6 +149,8 @@ func scanClaimedEvents(rows pgx.Rows, capacity int) ([]domain.OutboxEvent, error
 			&event.EventType,
 			&payload,
 			&event.Attempts,
+			&event.TraceParent,
+			&event.TraceState,
 		)
 		if err != nil {
 			return nil, translateError("scan claimed outbox event", err)

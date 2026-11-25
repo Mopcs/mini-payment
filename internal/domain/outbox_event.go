@@ -15,6 +15,10 @@ type OutboxEvent struct {
 	EventType     string
 	Payload       TransferCompletedPayload
 	Attempts      int
+	// TraceParent and TraceState carry the W3C trace context that produced the
+	// event. They stay out of Payload so the published contract is unchanged.
+	TraceParent string
+	TraceState  string
 }
 
 type TransferCompletedPayload struct {
