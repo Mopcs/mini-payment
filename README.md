@@ -61,6 +61,13 @@ All services publish ports only on `127.0.0.1`. Their data is stored in Docker n
 | `OTEL_TRACES_SAMPLER` | Sampler name | `parentbased_traceidratio` |
 | `OTEL_TRACES_SAMPLER_ARG` | Sampling ratio for the ratio samplers, 0 to 1 | `1.0` |
 | `JAEGER_UI_PORT` / `JAEGER_OTLP_PORT` | Published Jaeger ports | `16686` / `4317` |
+| `APP_ENV` | `development`, `production`, or `test` | `development` |
+| `HTTP_READ_HEADER_TIMEOUT` / `HTTP_READ_TIMEOUT` / `HTTP_WRITE_TIMEOUT` / `HTTP_IDLE_TIMEOUT` | Server deadlines, 1s to 5m | `5s` / `15s` / `30s` / `60s` |
+| `RATE_LIMIT_ENABLED` | Turn rate limiting on or off | `true` |
+| `RATE_LIMIT_AUTH_LIMIT` / `RATE_LIMIT_AUTH_WINDOW` | Login and registration budget | `10` / `1m` |
+| `RATE_LIMIT_FINANCIAL_LIMIT` / `RATE_LIMIT_FINANCIAL_WINDOW` | Deposit and transfer budget | `30` / `1m` |
+| `TRUSTED_PROXIES` | Comma separated IPs or CIDRs whose forwarded headers are believed | empty |
+| `CORS_ALLOWED_ORIGINS` / `CORS_ALLOW_CREDENTIALS` | Browser origins, empty disables CORS | empty / `false` |
 
 Compose requires PostgreSQL and Redis passwords from `.env`; RabbitMQ fallback credentials are for local development only.
 Environment variables already set in the shell take precedence over values loaded from `.env`.
@@ -490,3 +497,186 @@ the shared handler.
 | Only the API span, no transaction steps | The pool was created before tracing started; the tracer is attached when the pool is built. |
 | Consumer trace has no link | The message was published without a `traceparent` header, which happens when the worker ran with tracing disabled. |
 | Jaeger UI is empty but spans are exported | Jaeger keeps traces in memory and restarts empty. Check the time range in the UI. |
+
+## Security
+
+Deposits in this project are **simulated**. There is no connection to a real
+payment provider, card network, or bank; a deposit is a ledger entry created by
+the API itself. Treat every balance as test data.
+
+### Middleware order
+
+The chain is written out once in `internal/transport/http/server.go`, from the
+outside in:
+
+| Order | Layer | Why here |
+| --- | --- | --- |
+| 1 | Tracing | A rejected request still belongs to a trace |
+| 2 | Metrics | Records the status the client actually receives |
+| 3 | Security headers | Headers apply to every response, including errors |
+| 4 | CORS | Preflight is answered before route matching |
+| 5 | Rate limit | Rejects before a handler reads a body |
+| 6 | Router | The handlers themselves |
+
+### HTTP timeouts
+
+| Setting | Default | What it protects |
+| --- | --- | --- |
+| `HTTP_READ_HEADER_TIMEOUT` | `5s` | Slowloris: a client dribbling headers |
+| `HTTP_READ_TIMEOUT` | `15s` | Whole request read, including the body |
+| `HTTP_WRITE_TIMEOUT` | `30s` | Response write, covers the largest allowed body |
+| `HTTP_IDLE_TIMEOUT` | `60s` | Keeping an idle keep-alive connection open |
+
+Every value must be between one second and five minutes, and the read timeout
+must not be shorter than the header timeout. Graceful shutdown is unchanged: the
+server stops accepting connections and drains in-flight requests within its own
+shutdown context.
+
+### Request body limits
+
+`decodeJSONRequest` wraps the body in `http.MaxBytesReader` before any decoding:
+
+| Endpoint group | Limit |
+| --- | --- |
+| `/api/v1/auth/*` | 16 KiB |
+| wallets, deposits, transfers | 4 KiB |
+
+An oversized body returns `413` with `request_too_large`, a wrong content type
+returns `415`, malformed JSON returns `400`, and a second JSON value after the
+first is rejected with `400` as well. Nothing is buffered beyond the limit.
+
+### Rate limiting
+
+Counters live in Redis so every API instance shares one budget. Redis holds
+counters only: balances, transfers and idempotency remain in PostgreSQL.
+
+| Policy | Routes | Default |
+| --- | --- | --- |
+| `auth` | `POST /api/v1/auth/register`, `POST /api/v1/auth/login` | 10 per minute |
+| `financial` | `POST /api/v1/wallets/{id}/deposits`, `POST /api/v1/transfers` | 30 per minute |
+
+The key is the client IP address. Passwords, tokens and idempotency keys are
+never used as keys and never appear in rate limit logs.
+
+Responses:
+
+- `429` with `rate_limit_exceeded` and a `Retry-After` header rounded up to the
+  end of the window.
+- `503` with `rate_limit_unavailable` and `Retry-After: 1` when Redis cannot be
+  reached.
+
+**Failure policy: fail closed.** Neither policy degrades to "allow" when Redis is
+down. Authentication endpoints refuse the request rather than letting an
+unbounded number of password guesses through, and financial endpoints refuse it
+rather than processing unaccounted mutations. The trade-off is explicit: while
+Redis is unavailable, the affected endpoints return `503` instead of serving
+traffic. `payment_ratelimit_decisions_total{policy,outcome}` records every
+decision with `outcome` of `allowed`, `rejected`, or `unavailable`.
+
+`RATE_LIMIT_ENABLED=false` removes the middleware entirely. That is intended for
+local experiments only; nothing else compensates for it.
+
+### Trusted proxies
+
+Forwarded headers are **ignored by default**, because any client can send them.
+The resolver uses the peer address unless the peer matches `TRUSTED_PROXIES`:
+
+```sh
+# Believe X-Forwarded-For only when the request arrives from the local proxy
+TRUSTED_PROXIES=127.0.0.1/32,10.0.0.0/8
+```
+
+When the peer is trusted, `X-Forwarded-For` is walked from right to left and the
+first address that is not itself a trusted proxy is used. Entries further left
+were supplied by the client and are treated as untrusted. `X-Real-IP` is read
+only from a trusted peer.
+
+### CORS
+
+CORS is off by default because this API has no browser client. To enable it,
+list the exact origins:
+
+```sh
+CORS_ALLOWED_ORIGINS=https://app.example.com,https://admin.example.com
+CORS_ALLOW_CREDENTIALS=false
+```
+
+The origin is echoed rather than wildcarded, `Vary: Origin` is set, and preflight
+requests are validated: only `GET`, `POST`, and `OPTIONS` are allowed, with only
+`Authorization`, `Content-Type`, and `Idempotency-Key` as request headers.
+Anything else returns `403`. A wildcard origin is rejected at startup when
+credentials are enabled.
+
+For production, serve the browser client from an origin you control and keep
+`CORS_ALLOW_CREDENTIALS` false unless the client genuinely needs cookies.
+
+### Security headers
+
+Every response carries `X-Content-Type-Options: nosniff`,
+`Referrer-Policy: no-referrer`, `X-Frame-Options: DENY`, and
+`Content-Security-Policy: default-src 'none'; frame-ancestors 'none'`. The API
+serves JSON only, so a restrictive policy costs nothing. Responses under
+`/api/v1/auth/` are additionally marked `Cache-Control: no-store`.
+
+### Authentication
+
+- Only `HS256` is accepted. The algorithm is pinned twice: the key function
+  rejects any other method and `jwt.WithValidMethods` enforces it again.
+- Issuer, expiration, issued-at, and subject are all required; a token without a
+  usable subject is rejected.
+- Login returns the same `invalid_credentials` response for an unknown email and
+  a wrong password, so it never confirms which addresses are registered.
+- Password verification compares the derived key in constant time with
+  `crypto/subtle`.
+- Registration failures map to stable codes; internal database errors never reach
+  the client.
+
+### Production secrets
+
+With `APP_ENV=production`, startup fails when `JWT_SECRET` is shorter than 32
+bytes or looks like a placeholder (`replace`, `placeholder`, `change`, `example`,
+`local_dev`, `secret`, `password`, `your-`). Secret values are never logged; the
+startup line reports the issuer and TTL only.
+
+Rotation: changing `JWT_SECRET` invalidates every issued token at once, because
+there is no key identifier or refresh flow. Rotate during a maintenance window,
+or run two API versions side by side with different issuers and let the short
+access token TTL drain the old ones. `.env` is gitignored; `.env.example` holds
+placeholders only.
+
+### Audit log
+
+Security events are written with `slog` and marked `"audit": true`, so a log
+pipeline can route them separately from application logs:
+
+| Event | When |
+| --- | --- |
+| `auth.login_succeeded`, `auth.login_failed` | Login outcome, with a reason and never the email |
+| `auth.register_succeeded`, `auth.register_failed` | Registration outcome |
+| `security.authentication_failed` | Missing or invalid bearer token |
+| `security.wallet_access_denied` | A wallet that does not belong to the caller |
+| `security.financial_request_rejected` | Deposit or transfer rejected, with the stable reason code |
+| `security.rate_limit_exceeded` | A client hit its budget |
+| `security.rate_limit_unavailable` | Redis was unreachable, request refused |
+
+Audit events carry identifiers and outcomes only. Passwords, tokens,
+authorization headers, request bodies, amounts, and raw idempotency keys are
+never written.
+
+### Known limitations
+
+- Deposits are simulated; there is no payment provider integration.
+- Rate limiting is per client IP, not per account. A distributed attacker with
+  many addresses gets many budgets, and clients behind one NAT share theirs.
+- There is no account lockout, no breached-password check, and no CAPTCHA.
+- Tokens cannot be revoked before they expire; there is no refresh flow or
+  denylist.
+- Rate limiting depends on Redis. When it is down, the protected endpoints fail
+  closed rather than serving traffic.
+- Audit events go to stdout with the rest of the logs. There is no durable audit
+  store, retention policy, or tamper protection.
+- Metrics, tracing, Prometheus, Grafana, and Jaeger are separate listeners bound
+  to loopback. They are not behind the API's authentication and must not be
+  exposed publicly.
+- There is no WAF, mTLS, or request signing. Transport security is expected to be
+  terminated by a proxy in front of the API.
