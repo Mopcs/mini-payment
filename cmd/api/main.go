@@ -15,10 +15,12 @@ import (
 	"github.com/Mopcs/mini-payment-system/internal/infrastructure/postgres"
 	redisinfra "github.com/Mopcs/mini-payment-system/internal/infrastructure/redis"
 	"github.com/Mopcs/mini-payment-system/internal/observability"
+	"github.com/Mopcs/mini-payment-system/internal/ratelimit"
 	authservice "github.com/Mopcs/mini-payment-system/internal/service/auth"
 	transferservice "github.com/Mopcs/mini-payment-system/internal/service/transfer"
 	walletservice "github.com/Mopcs/mini-payment-system/internal/service/wallet"
 	httpserver "github.com/Mopcs/mini-payment-system/internal/transport/http"
+	"github.com/Mopcs/mini-payment-system/internal/transport/http/middleware"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/prometheus/client_golang/prometheus"
 	redis "github.com/redis/go-redis/v9"
@@ -38,6 +40,8 @@ type apiServerDependencies struct {
 	tokens      *authservice.TokenManager
 	registry    *prometheus.Registry
 	metrics     *observability.HTTPMetrics
+	auditor     *observability.Auditor
+	rateLimit   *middleware.RateLimit
 	logger      *slog.Logger
 }
 
@@ -89,6 +93,8 @@ func newRuntime(ctx context.Context, cfg config.Config, logger *slog.Logger) (*a
 	registry := observability.NewRegistry()
 	registry.MustRegister(observability.NewPGXPoolCollector(pool))
 	httpMetrics := observability.NewHTTPMetrics(registry)
+	rateLimitMetrics := observability.NewRateLimitMetrics(registry)
+	auditor := observability.NewAuditor(logger)
 	metricsServer, err := observability.StartMetricsServer(cfg.APIMetricsAddr, registry, logger)
 	if err != nil {
 		_ = redisClient.Close()
@@ -102,6 +108,8 @@ func newRuntime(ctx context.Context, cfg config.Config, logger *slog.Logger) (*a
 		tokens:      tokens,
 		registry:    registry,
 		metrics:     httpMetrics,
+		auditor:     auditor,
+		rateLimit:   newRateLimit(cfg, redisClient, rateLimitMetrics, auditor, logger),
 		logger:      logger,
 	})
 	return &apiRuntime{
@@ -123,8 +131,20 @@ func newHTTPServer(dependencies apiServerDependencies) *http.Server {
 		TransferService: transferservice.NewService(dependencies.pool),
 		Tokens:          dependencies.tokens,
 		Logger:          dependencies.logger,
+		Auditor:         dependencies.auditor,
 		Registry:        dependencies.registry,
 		Metrics:         dependencies.metrics,
+		RateLimit:       dependencies.rateLimit,
+		CORS: middleware.CORSConfig{
+			AllowedOrigins:   dependencies.config.CORSAllowedOrigins,
+			AllowCredentials: dependencies.config.CORSAllowCredentials,
+		},
+		Timeouts: httpserver.Timeouts{
+			ReadHeader: dependencies.config.HTTPReadHeaderTimeout,
+			Read:       dependencies.config.HTTPReadTimeout,
+			Write:      dependencies.config.HTTPWriteTimeout,
+			Idle:       dependencies.config.HTTPIdleTimeout,
+		},
 	})
 }
 
@@ -174,4 +194,68 @@ func shutdownAPI(server *http.Server, logger *slog.Logger) error {
 	}
 	logger.Info("HTTP server stopped")
 	return nil
+}
+
+// newRateLimit builds the limiter. A nil result means the middleware is
+// skipped entirely.
+func newRateLimit(
+	cfg config.Config,
+	client *redis.Client,
+	metrics *observability.RateLimitMetrics,
+	auditor *observability.Auditor,
+	logger *slog.Logger,
+) *middleware.RateLimit {
+	if !cfg.RateLimitEnabled {
+		logger.Info("rate limiting disabled")
+		return nil
+	}
+
+	policies := rateLimitPolicies(cfg)
+	logRateLimitPolicies(cfg, policies, logger)
+
+	return middleware.NewRateLimit(middleware.RateLimitConfig{
+		Limiter:  ratelimit.NewRedisLimiter(client),
+		Resolver: middleware.NewClientIPResolver(cfg.TrustedProxies),
+		Policies: policies,
+		Metrics:  metrics,
+		Auditor:  auditor,
+		Logger:   logger,
+	})
+}
+
+// rateLimitPolicies maps the exact ServeMux patterns to their budget.
+func rateLimitPolicies(cfg config.Config) map[string]ratelimit.Policy {
+	authPolicy := ratelimit.Policy{
+		Name:   "auth",
+		Limit:  cfg.RateLimitAuthLimit,
+		Window: cfg.RateLimitAuthWindow,
+	}
+	financialPolicy := ratelimit.Policy{
+		Name:   "financial",
+		Limit:  cfg.RateLimitFinancialLimit,
+		Window: cfg.RateLimitFinancialWindow,
+	}
+
+	return map[string]ratelimit.Policy{
+		"POST /api/v1/auth/register":         authPolicy,
+		"POST /api/v1/auth/login":            authPolicy,
+		"POST /api/v1/wallets/{id}/deposits": financialPolicy,
+		"POST /api/v1/transfers":             financialPolicy,
+	}
+}
+
+func logRateLimitPolicies(
+	cfg config.Config,
+	policies map[string]ratelimit.Policy,
+	logger *slog.Logger,
+) {
+	auth := policies["POST /api/v1/auth/login"]
+	financial := policies["POST /api/v1/transfers"]
+	logger.Info("rate limiting enabled",
+		slog.Int("auth_limit", auth.Limit),
+		slog.Duration("auth_window", auth.Window),
+		slog.Int("financial_limit", financial.Limit),
+		slog.Duration("financial_window", financial.Window),
+		slog.Int("trusted_proxies", len(cfg.TrustedProxies)),
+	)
 }
