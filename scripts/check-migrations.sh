@@ -80,6 +80,6 @@ esac
 
 echo "migration check: applying to $target_db"
 POSTGRES_DB="$target_db" go run ./cmd/migrate up
-POSTGRES_DB="$target_db" go run ./cmd/migrate down 1
+POSTGRES_DB="$target_db" go run ./cmd/migrate down
 POSTGRES_DB="$target_db" go run ./cmd/migrate up
 echo "migration check: apply, rollback, and re-apply succeeded"
