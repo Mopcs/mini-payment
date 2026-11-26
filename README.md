@@ -1,28 +1,137 @@
- Mini Payment Processing System
+# Mini Payment Processing System
 
-[![CI](https://github.com/Mopcs/mini-payment/actions/workflows/ci.yml/badge.svg)](https://github.com/Mopcs/mini-payment/actions/workflows/ci.yml)
+A Go backend for wallet-to-wallet transfers with a PostgreSQL-backed double-entry
+ledger. **Deposits are simulated**: no card network, bank, or payment provider is
+contacted, and every balance in this repository is test data.
 
-A Go modular monolith for processing payments between users. PostgreSQL is the source of truth for financial data; Redis is reserved for supporting features such as caching and rate limiting.
+The system is a modular monolith with three processes (API, outbox worker, and
+RabbitMQ consumer) sharing PostgreSQL and Redis. PostgreSQL is the financial
+source of truth; Redis holds rate-limit counters and answers readiness checks
+only — balances and ledger state never leave the database.
 
-## Technologies
+The CI workflow is in `.github/workflows/ci.yml`. No status badge is included
+here because this checkout has no canonical remote repository URL; a badge
+pointing at the wrong slug would be misleading.
 
-- Go
-- PostgreSQL 17
-- Redis 7
-- Docker Compose
+## Features
+
+- JWT authentication with argon2id password hashing
+- Wallets in USD, EUR, and JPY with simulated, idempotent deposits
+- Atomic transfers between wallets with deterministic row-level locking
+- Append-only double-entry ledger with a deferred balanced-transaction check
+- Idempotency keys that prevent duplicate financial effects
+- Transactional outbox, RabbitMQ publisher with confirms, and idempotent consumer
+- Prometheus metrics, provisioned Grafana dashboards, and OpenTelemetry tracing
+- Optional loopback-only pprof listener for local profiling
+- Docker Compose stack, GitHub Actions CI, k6 load scenarios, and invariant checks
+
+## Architecture
+
+| Component | Responsibility |
+| --- | --- |
+| `cmd/api` | HTTP transport, authentication, wallet and transfer handlers |
+| `cmd/worker` | Claims outbox rows and publishes them to RabbitMQ |
+| `cmd/consumer` | Consumes transfer events and writes notifications idempotently |
+| PostgreSQL | Users, wallets, ledger, idempotency records, outbox, and notifications |
+| Redis | Shared rate-limit counters and readiness ping |
+| RabbitMQ | Durable `payment.events` exchange and retry/dead-letter topology |
+| Prometheus / Grafana | Metrics collection and provisioned dashboards |
+| Jaeger | Local OTLP tracing backend |
+
+The application code is split into `transport` (HTTP), `service` (use cases),
+`domain` (types), and `repository/postgres` (persistence). Detailed diagrams
+are in [docs/architecture.md](docs/architecture.md); the schema is in
+[docs/database.md](docs/database.md).
+
+## Architecture decisions
+
+- **PostgreSQL is the source of truth.** Financial writes commit there or not
+  at all; Redis is never authoritative for money.
+- **Integer minor units** avoid floating-point rounding (`BIGINT` in PostgreSQL,
+  `int64` in Go).
+- **Double-entry ledger** makes every movement balance to zero and keeps an
+  immutable audit trail.
+- **Deterministic wallet locks** in UUID order prevent opposite-direction
+  transfers from deadlocking.
+- **Transactional outbox** ties the event to the transfer commit; the worker
+  publishes it later.
+- **At-least-once delivery plus idempotent consumption** tolerates retries
+  without duplicate notifications.
+
+The trade-offs and rationale are documented in
+[docs/architecture-decisions.md](docs/architecture-decisions.md).
+
+## Technology stack
+
+- Go 1.26.5 (module version), `net/http` ServeMux, pgx v5, go-redis v9
+- PostgreSQL 17, Redis 7, RabbitMQ 4
+- JWT (`golang-jwt/jwt/v5`) and argon2id (`golang.org/x/crypto`)
+- Prometheus `client_golang`, Grafana 13, OpenTelemetry 1.47, Jaeger 1.76
+- Docker Compose 5.5, GitHub Actions, k6 2.4.0 (pinned container image)
+
+## Project structure
+
+```text
+cmd/api/                 HTTP server entrypoint
+cmd/worker/              outbox relay entrypoint
+cmd/consumer/            RabbitMQ consumer entrypoint
+cmd/migrate/             migration CLI
+cmd/healthcheck/         static probe used in container images
+internal/config/         environment validation and defaults
+internal/domain/         money types and financial payloads
+internal/service/        authentication, wallet, and transfer use cases
+internal/repository/postgres/  SQL repositories and transaction logic
+internal/transport/http/       handlers, middleware, and server wiring
+internal/consumer/transfer/    event consumption
+internal/worker/outbox/        outbox claiming and publishing
+internal/observability/  metrics, tracing, audit log, and pool collector
+internal/profiling/      optional loopback-only pprof listener
+migrations/              numbered SQL migrations
+deployments/monitoring/  Prometheus and Grafana provisioning
+tests/load/              k6 scenarios and read-only invariant checks
+docs/                    architecture, schema, API spec, ADRs, performance report
+```
+
+## Prerequisites
+
+- Go 1.26.5 or newer (the module declares `go 1.26.5`)
+- Docker with Compose (validated here with Docker Compose 5.5.0)
+- Python 3 for the dashboard validation helper
+- `make` for the repository targets; `psql` is optional for manual SQL checks
+
+k6 is not required locally: the load runner uses the pinned
+`grafana/k6:2.4.0` container.
 
 ## Local setup
 
 1. Copy `.env.example` to `.env` and adjust the local credentials if needed.
-2. Start Docker Desktop (or another Docker Engine with Compose).
-3. Run `make config` to validate the Compose configuration.
-4. Run `make up` to start PostgreSQL, Redis, RabbitMQ, Prometheus, Grafana, and Jaeger.
-5. Run `make ps` to check container health.
-6. Start the API with `go run ./cmd/api`.
-7. Check `http://localhost:8080/health` and `http://localhost:8080/ready`.
-8. Open Grafana at `http://localhost:3000` for the provisioned dashboards, and Prometheus at `http://localhost:9090`.
+2. Start Docker Desktop or another Docker Engine with Compose.
+3. Validate and start the infrastructure:
 
-All services publish ports only on `127.0.0.1`. Their data is stored in Docker named volumes and survives container restarts. Redis persistence uses AOF, and Prometheus keeps 15 days of metrics by default.
+   ```sh
+   make config
+   make up
+   make ps
+   ```
+
+4. Apply migrations: `make migrate-up`.
+5. Start the three processes in separate shells:
+
+   ```sh
+   go run ./cmd/api
+   go run ./cmd/worker
+   go run ./cmd/consumer
+   ```
+
+6. Check `http://127.0.0.1:8080/health` and `http://127.0.0.1:8080/ready`.
+7. Run the checks described in [Testing](#testing).
+8. Open Grafana at `http://127.0.0.1:3000` and Prometheus at
+   `http://127.0.0.1:9090`.
+
+All services publish ports only on `127.0.0.1`. Data lives in Docker named
+volumes and survives container restarts. Redis persistence uses AOF, and
+Prometheus keeps 15 days of metrics by default. Run `make down` to stop the
+stack, or `make clean` **only** if you intend to delete its data volumes.
 
 ## Environment variables
 
@@ -65,6 +174,9 @@ All services publish ports only on `127.0.0.1`. Their data is stored in Docker n
 | `JAEGER_UI_PORT` / `JAEGER_OTLP_PORT` | Published Jaeger ports | `16686` / `4317` |
 | `APP_ENV` | `development`, `production`, or `test` | `development` |
 | `HTTP_READ_HEADER_TIMEOUT` / `HTTP_READ_TIMEOUT` / `HTTP_WRITE_TIMEOUT` / `HTTP_IDLE_TIMEOUT` | Server deadlines, 1s to 5m | `5s` / `15s` / `30s` / `60s` |
+| `POSTGRES_MAX_CONNS` / `POSTGRES_MIN_CONNS` | pgxpool size, `min` must not exceed `max` | `10` / `1` |
+| `POSTGRES_MAX_CONN_LIFETIME` / `POSTGRES_MAX_CONN_IDLE_TIME` | pgxpool connection lifetimes | `1h` / `30m` |
+| `PROFILING_ENABLED` / `PROFILING_ADDR` | Opt-in pprof listener; only loopback addresses are accepted | `false` / `127.0.0.1:6060` |
 | `RATE_LIMIT_ENABLED` | Turn rate limiting on or off | `true` |
 | `RATE_LIMIT_AUTH_LIMIT` / `RATE_LIMIT_AUTH_WINDOW` | Login and registration budget | `10` / `1m` |
 | `RATE_LIMIT_FINANCIAL_LIMIT` / `RATE_LIMIT_FINANCIAL_WINDOW` | Deposit and transfer budget | `30` / `1m` |
@@ -75,12 +187,92 @@ Compose requires PostgreSQL and Redis passwords from `.env`; RabbitMQ fallback c
 Environment variables already set in the shell take precedence over values loaded from `.env`.
 Replace the `JWT_SECRET` placeholder in `.env` with a cryptographically random value before running the API; never commit `.env` or use the example value outside local development.
 
-## Registration and login
+## API documentation
 
-- `POST /api/v1/auth/register` creates a user and an initial zero-balance USD wallet in one PostgreSQL transaction.
-- `POST /api/v1/auth/login` verifies the email and password and returns the same generic error for either invalid value.
+All application routes are under `/api/v1`. Requests and responses use
+`application/json`; unknown JSON fields, trailing values, and bodies over 4 KiB
+(16 KiB for auth) are rejected. Except for auth and health, routes require
+`Authorization: Bearer <access_token>`. Deposits and transfers also require a
+trimmed `Idempotency-Key` header of 1–128 bytes. A replay returns the original
+result with `Idempotent-Replay: true`.
 
-Passwords must contain at least 12 Unicode characters and at most 1024 bytes. They are stored as Argon2id hashes using 64 MiB memory, 3 iterations, 2 threads, a random 16-byte salt, and a 32-byte output. Access tokens use HS256 and contain only `sub` (the user UUID), `iat`, `exp`, and `iss`; no email or password data is included.
+| Method | Path | Auth | Purpose |
+| --- | --- | --- | --- |
+| `POST` | `/api/v1/auth/register` | No | Create user and initial USD wallet |
+| `POST` | `/api/v1/auth/login` | No | Issue an access token |
+| `GET` | `/api/v1/wallets` | Bearer | List the caller's wallets |
+| `POST` | `/api/v1/wallets` | Bearer | Create a wallet in USD, EUR, or JPY |
+| `GET` | `/api/v1/wallets/{id}` | Bearer | Read one owned wallet |
+| `POST` | `/api/v1/wallets/{id}/deposits` | Bearer + key | Simulate a deposit |
+| `POST` | `/api/v1/transfers` | Bearer + key | Transfer between owned wallets |
+| `GET` | `/api/v1/transfers` | Bearer | List transfers visible to the caller |
+| `GET` | `/health` | No | Liveness probe |
+| `GET` | `/ready` | No | PostgreSQL and Redis readiness |
+| `GET` | `/metrics` | No | Prometheus exposition format |
+
+Register or log in:
+
+```sh
+curl -s -X POST http://127.0.0.1:8080/api/v1/auth/register \
+  -H 'Content-Type: application/json' \
+  -d '{"email":"dev@example.com","password":"a-long-test-password"}'
+```
+
+```json
+{
+  "user": {"id": "…", "email": "dev@example.com"},
+  "access_token": "…",
+  "token_type": "Bearer",
+  "expires_in": 900
+}
+```
+
+Create a wallet and simulate a deposit:
+
+```sh
+curl -s -X POST http://127.0.0.1:8080/api/v1/wallets \
+  -H 'Authorization: Bearer <token>' -H 'Content-Type: application/json' \
+  -d '{"currency":"USD"}'
+
+curl -s -X POST http://127.0.0.1:8080/api/v1/wallets/<wallet-id>/deposits \
+  -H 'Authorization: Bearer <token>' -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: deposit-0001' \
+  -d '{"amount":1000,"currency":"USD"}'
+```
+
+A deposit response contains `transaction_id`, `wallet_id`, `amount`, `currency`,
+`balance`, and `created_at`. Amounts and balances are integer minor units.
+
+Transfer between two owned wallets of the same currency:
+
+```sh
+curl -s -X POST http://127.0.0.1:8080/api/v1/transfers \
+  -H 'Authorization: Bearer <token>' -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: transfer-0001' \
+  -d '{"source_wallet_id":"…","destination_wallet_id":"…","amount":1000,"currency":"USD"}'
+```
+
+The response contains `transfer_id`, `transaction_id`, both wallet IDs,
+`amount`, `currency`, `source_balance`, `destination_balance`, and
+`created_at`. `GET /api/v1/transfers` accepts `limit` (1–100), `offset`
+(0–1 000 000), `direction` (`incoming` or `outgoing`), and `currency`, and
+returns `items`, `limit`, `offset`, and `total`.
+
+Errors use `{"error":{"code":"…","message":"…"}}`. Important codes:
+
+| Status | Codes |
+| --- | --- |
+| `400` | `invalid_request`, `invalid_email`, `invalid_password`, `invalid_amount`, `invalid_currency`, `currency_mismatch`, `invalid_transfer`, `invalid_wallet_id`, `invalid_idempotency_key`, `invalid_query` |
+| `401` | `unauthorized`, `invalid_credentials` |
+| `404` | `wallet_not_found` |
+| `409` | `email_already_registered`, `wallet_already_exists`, `idempotency_conflict` |
+| `415` | `unsupported_media_type` |
+| `413` | `request_too_large` |
+| `422` | `insufficient_funds`, `balance_limit` |
+| `500` | `internal_error` |
+
+The complete machine-readable contract is in
+[docs/openapi.yaml](docs/openapi.yaml).
 
 ## Make commands
 
@@ -145,6 +337,41 @@ Authorization: Bearer <access-token>
 ```
 
 An empty result uses `"items": []`. The existing source history index (`ledger_transactions_wallet_created_idx`) and destination history index (`ledger_transactions_destination_wallet_idx`) support the two wallet relationships and ordering; no additional index is needed.
+
+## Testing
+
+| Level | What it covers | Command |
+| --- | --- | --- |
+| Unit | Handlers, services, config, repositories with fakes | `make test` |
+| Race | The same suite under the Go race detector | `make test-race` |
+| Integration | Real PostgreSQL, Redis, and RabbitMQ | set `TEST_DATABASE_URL`, `OUTBOX_TEST_DATABASE_URL`, `CONSUMER_TEST_DATABASE_URL`, `TEST_RABBITMQ_URL`, `TEST_REDIS_ADDR` |
+| Concurrency | Same-wallet, opposite-direction, and replay cases | `TestTransferIntegration` in `internal/service/wallet` |
+| Load | k6 baseline, transfers, idempotency, stress | `tests/load/run.sh <scenario>` |
+| Financial invariants | Read-only SQL checks after a load run | `tests/load/verify/run-verify.sh` |
+
+Integration tests skip themselves when their dedicated test dependencies are
+missing; CI provides all of them so a missing service fails the job instead of
+silently reducing coverage. To prepare the three test databases locally:
+
+```sh
+make test-databases
+TEST_DATABASE_URL='postgres://payment_user:<password>@127.0.0.1:5432/payment_db_test?sslmode=disable' \
+OUTBOX_TEST_DATABASE_URL='postgres://payment_user:<password>@127.0.0.1:5432/payment_outbox_test?sslmode=disable' \
+CONSUMER_TEST_DATABASE_URL='postgres://payment_user:<password>@127.0.0.1:5432/payment_consumer_test?sslmode=disable' \
+TEST_RABBITMQ_URL='amqp://payment_user:<password>@127.0.0.1:5672/' \
+TEST_REDIS_ADDR=127.0.0.1:6379 \
+make test-race
+```
+
+The load suite never targets a production host. Copy
+`tests/load/.env.k6.example` to `tests/load/.env.k6`, set `BASE_URL` and the
+password, raise the rate limits on the target API, and read
+`tests/load/README.md` before running it. The invariant script only reads the
+database; it checks negative balances, conservation of funds, balanced ledger
+entries, idempotency, and outbox/consumer progress.
+
+The measured before-and-after performance work is recorded in
+[docs/performance-report.md](docs/performance-report.md).
 
 ## Integration tests
 
@@ -254,6 +481,18 @@ $env:OUTBOX_TEST_DATABASE_URL = 'postgres://payment_user:test-only-password@127.
 go test ./internal/worker/outbox -count=1
 go test -race ./internal/worker/outbox -count=1
 ```
+
+## Observability
+
+- **Metrics:** each process exposes Prometheus metrics on its own port
+  (API `9091`, worker `9092`, consumer `9093`); the API also serves `/metrics`.
+- **Dashboards:** Grafana is provisioned with two dashboards in the
+  `Mini Payment System` folder; see [Monitoring](#monitoring).
+- **Tracing:** OpenTelemetry spans are exported over OTLP to a local Jaeger;
+  see [Distributed tracing](#distributed-tracing).
+- **Logging:** structured JSON with request IDs, audit events, and errors;
+  identifiers and secrets are kept out of spans and audit records.
+- **Profiling:** opt-in, loopback-only pprof; see [Profiling](#profiling).
 
 ## Monitoring
 
@@ -733,6 +972,32 @@ never written.
   exposed publicly.
 - There is no WAF, mTLS, or request signing. Transport security is expected to be
   terminated by a proxy in front of the API.
+
+## Limitations
+
+- Deposits are simulated; no card network, bank, or payment provider is called.
+- There is no withdrawal, currency conversion, or external settlement flow.
+- Transfer history uses offset pagination, not cursor pagination; very deep
+  offsets are bounded at 1 000 000.
+- There are no roles, administrative endpoints, or multi-tenant organisations.
+- Event notifications are written to `notifications`; there is no email, SMS, or
+  webhook delivery.
+- The service layer depends on concrete PostgreSQL repositories and their error
+  constants rather than interfaces; swapping the database would require a
+  deliberate refactor.
+- Consumer throughput has no standalone events/s benchmark; it is validated by
+  the absence of stale published events in the invariant checks.
+- pprof is available only on an opt-in loopback listener of the API process,
+  not on the worker, consumer, or public listener.
+
+Security-specific limitations are listed under
+[Known limitations](#known-limitations).
+
+## Repository presentation
+
+Suggested description, topic tags, and badge guidance are collected in
+[docs/github-presentation.md](docs/github-presentation.md). No GitHub URL or CI
+status is assumed in this checkout.
 
 ## Continuous integration
 
