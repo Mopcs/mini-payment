@@ -282,14 +282,14 @@ Every run prints a block and writes a JSON report:
 
 ```text
 === transfers ===
-target        http://api:8080
+target        http://host.docker.internal:8080
 command       k6 run scenarios/transfers.js
-requests      2882 (71.6/s)
+requests      11815 (186.2/s)
 failed        0.00%
-duration      p50 127ms  p95 288ms  p99 382ms
+duration      p50 62ms  p95 138ms  p99 206ms
 checks        100.00%
 thresholds    8 passed, 0 failed
-report        results/transfers-2026-11-26T04-30-27-700Z.json
+report        results/transfers-2026-11-26T05-39-18-035Z.json
 ```
 
 A non-zero exit code means at least one threshold failed. The report keeps the
@@ -327,22 +327,27 @@ Every number here is bounded by the environment that produced it:
 Compare runs made on the same machine with the same configuration. Do not compare
 against a number in a README, including this one.
 
-For orientation only, one set of runs on a single Windows laptop with Docker
-Desktop, with all six services and k6 sharing the CPU, produced:
+For orientation only, two sets of runs on the same Windows laptop. The first had
+the application in containers alongside k6, so six services shared the CPU. The
+second ran the three processes on the host with only k6 containerised:
 
-| Scenario | Requests | Rate | Failed | p50 | p95 | p99 |
-| --- | --- | --- | --- | --- | --- | --- |
-| `baseline` | 361 | 12.9/s | 0.00% | 2 ms | 258 ms | 359 ms |
-| `transfers` | 2882 | 71.6/s | 0.00% | 127 ms | 288 ms | 382 ms |
-| `idempotency` | 86 | 9.4/s | 0.00% | 4 ms | 476 ms | 520 ms |
-| `stress` | 3970 | 39.1/s | 0.00% | 204 ms | 1210 ms | 1796 ms |
+| Setup | Scenario | Requests | Rate | Failed | p50 | p95 | p99 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| containers | `baseline` | 361 | 12.9/s | 0.00% | 2 ms | 258 ms | 359 ms |
+| containers | `transfers` | 2882 | 71.6/s | 0.00% | 127 ms | 288 ms | 382 ms |
+| containers | `stress` | 3970 | 39.1/s | 0.00% | 204 ms | 1210 ms | 1796 ms |
+| host | `baseline` | 525 | 15.6/s | 0.00% | 4 ms | 34 ms | 110 ms |
+| host | `transfers` | 11815 | 186.2/s | 0.00% | 62 ms | 138 ms | 206 ms |
+| host | `stress` | 67269 | 170.9/s | 0.00% | 32 ms | 666 ms | 1359 ms |
 
-Those are observations of one environment, not a benchmark. The `stress` row is
-the interesting one: latency degrades sharply at the top stage while the error
-rate stays at zero, which is what saturation without failure looks like. The
-`baseline` p95 is dominated by the first pass through cold caches; the per
-endpoint p95 in that same report was much lower (`health` 3.5 ms, `ready` 5.7 ms,
-`wallets_list` 4.1 ms, `wallet_get` 6.2 ms, `transfer_history` 17.7 ms).
+The gap between the two is the measurement, not the system: the same code served
+186 transfers per second on the host and 72 in containers. Throughput here is
+bounded by how much CPU the whole stack gets, which is exactly why a number from
+one machine means nothing on another.
+
+Those are observations of one environment, not a benchmark. In both setups the
+error rate stayed at zero while latency rose, which is what saturation without
+failure looks like.
 
 ## Monitoring during a run
 
@@ -454,9 +459,11 @@ PENDING_AGE_SECONDS=300 tests/load/verify/run-verify.sh
 
 Draining is not instant. The outbox worker publishes one event per broker
 confirm, so its ceiling is well below what the API can accept during a stress
-run. After the stress scenario in this repository the backlog reached roughly
-1900 unpublished events and took a few minutes to clear; the checks reported
-them as violations until it did, which is the correct behaviour. Watch it with:
+run. The measured rate is about 20 events per second. After the full suite in
+this repository (11 754 transfers plus roughly 21 000 from the stress run) the
+backlog peaked at 23 226 unpublished events and took about 18 minutes to clear,
+at which point the check went green. That is the correct behaviour, not a
+failure of the check. Watch it with:
 
 ```sql
 SELECT count(*) FILTER (WHERE published_at IS NULL) AS pending,
@@ -476,34 +483,43 @@ counter can be right while the ledger is wrong.
 
 ## What these runs found
 
-Two findings, both real and neither fixed here, because this iteration is the
-measurement, not the optimisation.
+Two findings came out of the original runs. Both were reproduced with `EXPLAIN`
+and PostgreSQL row counts, not inferred from a dashboard, and both have since
+been fixed and re-measured. The full before-and-after evidence is in
+`docs/performance-report.md`.
 
-**`GET /api/v1/transfers` degrades with table size.** The history predicate is
-`EXISTS(...) OR EXISTS(...)` against `wallets`, which PostgreSQL cannot turn into
-an index scan, so every history request runs a sequential scan of
-`ledger_transactions` twice, plus a top-N sort. On a database with a few hundred
-transfers the history endpoint had a p95 of 17.7 ms and the baseline passed; once
-the table held about 8 400 rows the same endpoint reached a p95 of 743 ms and the
-baseline thresholds failed. Measured on that data:
+**`GET /api/v1/transfers` degraded with table size.** The old
+`EXISTS(...) OR EXISTS(...)` predicate against `wallets` was not sargable, so
+each history request ran a sequential scan of `ledger_transactions` plus a top-N
+sort; the count and the page both paid it. The high cost estimate also crossed
+PostgreSQL's `jit_above_cost`, adding hundreds of milliseconds of JIT per
+execution.
 
-| Formulation | Plan | Time |
-| --- | --- | --- |
-| `EXISTS(..) OR EXISTS(..)` (current) | Seq scan, cost 130744 | 82 ms |
-| two joins combined with `UNION` | Index scans, cost 720 | 7.4 ms |
+The cleanest evidence was two `baseline` runs on the same machine, same code, same
+configuration, differing only in how much data the table held. Every other
+endpoint stayed flat, which ruled out the machine:
 
-The count and the page both pay this. A rewrite is worth doing, but it belongs in
-its own change with its own tests, not folded into a load-testing iteration.
+| `ledger_transactions` | `transfer_history` p95 | `wallet_get` p95 | `wallets_list` p95 |
+| --- | --- | --- | --- |
+| ~2 000 rows | 12.4 ms | 11.5 ms | 7.6 ms |
+| ~35 000 rows | 584 ms | 4.7 ms | 4.7 ms |
 
-**The outbox relay saturates before the API does.** Publishing is serial and waits
-for a broker confirm per message. During the stress scenario the API accepted
-transfers faster than the relay published them, leaving roughly 1 900 events
-queued; the backlog drained in a few minutes at about 22 events per second. No
-request failed, so this is a throughput ceiling rather than a correctness bug, but
-it means the pipeline's ceiling is far below the API's.
+The query now joins from the user's wallets into `ledger_transactions` and
+combines the two directions with `UNION`. On the same database and data, the old
+statement took 1 500.3 ms (including 795.7 ms of JIT); the rewritten page query
+takes 22.1 ms. After the change, `transfer_history` p95 fell from 584 ms to
+35.5 ms, the baseline from 585 ms to 95 ms, and baseline thresholds went from
+6/9 passing to 9/9.
 
-Neither finding was inferred from a dashboard. Both were reproduced with `EXPLAIN`
-and with row counts taken from PostgreSQL.
+**The outbox relay saturated before the API did.** Publishing is serial and waits
+for a broker confirm per message; the relay measured about 20 events per second
+while the API accepted 186 transfers per second in the same run. During stress
+the backlog grew to 23 226 events and took roughly 18 minutes to drain. No
+request failed, so this was a throughput ceiling rather than a correctness bug.
+The worker now claims the next batch immediately when the previous one was full
+instead of waiting out the poll interval. Measured drain rate rose from ~20/s to
+~94/s without adding concurrency, changing the batch size, or weakening
+publisher confirms.
 
 ## Limitations
 
@@ -516,13 +532,15 @@ and with row counts taken from PostgreSQL.
   limit must be raised, which the safety section already requires.
 - No k6 browser or protocol beyond HTTP; nothing here exercises WebSockets,
   because the system has none.
-- The suite was validated by running all four scenarios against a containerised
-  stack on one machine. It has not been run against a multi-host deployment, and
+- The suite was validated by running all four scenarios twice on one machine: once
+  with the application in containers, once with the three processes on the host and
+  only k6 containerised. It has not been run against a multi-host deployment, and
   no capacity numbers are claimed: the figures above are single-run observations
   of one laptop.
 - The outbox relay is the first component to saturate. It publishes serially and
-  waits for a broker confirm per message, so a run that outpaces it leaves a
-  backlog that the invariant checks will report until it drains. That is a real
-  property of the design, not a test artefact, and this suite does not fix it.
+  waits for a broker confirm per message, about 20 events per second, so a run
+  that outpaces it leaves a backlog that the invariant checks will report until it
+  drains. That is a real property of the design, not a test artefact, and this
+  suite does not fix it.
 - Thresholds ship as defaults tuned to pass on a development machine. They are a
   regression guard. Re-derive them from your own baseline before trusting them.
