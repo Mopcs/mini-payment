@@ -1,0 +1,681 @@
+openapi: 3.0.3
+info:
+  title: Mini Payment Processing System API
+  version: "1.0.0"
+  description: |
+    REST API for wallets and wallet-to-wallet transfers.
+
+    Deposits are simulated only. No card network, bank, or payment provider is
+    contacted, and all balances are test data. Monetary values are integer
+    minor units (cents for USD/EUR, whole yen for JPY).
+servers:
+  - url: http://127.0.0.1:8080
+    description: Local development server
+tags:
+  - name: auth
+    description: Registration and login
+  - name: wallets
+    description: Wallets and simulated deposits
+  - name: transfers
+    description: Wallet-to-wallet transfers and history
+  - name: operations
+    description: Health and metrics
+paths:
+  /api/v1/auth/register:
+    post:
+      tags: [auth]
+      summary: Register a user and create an initial USD wallet
+      description: User and first wallet are created in one PostgreSQL transaction.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CredentialsRequest"
+      responses:
+        "201":
+          description: Account created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AuthResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "409":
+          description: Email is already registered
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "413":
+          $ref: "#/components/responses/TooLarge"
+        "415":
+          $ref: "#/components/responses/UnsupportedMediaType"
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /api/v1/auth/login:
+    post:
+      tags: [auth]
+      summary: Log in and receive an access token
+      description: Invalid email and invalid password return the same generic error.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CredentialsRequest"
+      responses:
+        "200":
+          description: Login succeeded
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AuthResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          description: Invalid credentials
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "413":
+          $ref: "#/components/responses/TooLarge"
+        "415":
+          $ref: "#/components/responses/UnsupportedMediaType"
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /api/v1/wallets:
+    get:
+      tags: [wallets]
+      summary: List the caller's wallets
+      responses:
+        "200":
+          description: Wallets owned by the authenticated user
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/WalletList"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "500":
+          $ref: "#/components/responses/InternalError"
+    post:
+      tags: [wallets]
+      summary: Create a wallet
+      description: One wallet per currency per user is allowed.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateWalletRequest"
+      responses:
+        "201":
+          description: Wallet created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Wallet"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "409":
+          description: A wallet for this currency already exists
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "413":
+          $ref: "#/components/responses/TooLarge"
+        "415":
+          $ref: "#/components/responses/UnsupportedMediaType"
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /api/v1/wallets/{id}:
+    get:
+      tags: [wallets]
+      summary: Read one owned wallet
+      parameters:
+        - $ref: "#/components/parameters/WalletID"
+      responses:
+        "200":
+          description: Wallet
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Wallet"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/WalletNotFound"
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /api/v1/wallets/{id}/deposits:
+    post:
+      tags: [wallets]
+      summary: Simulate a deposit
+      description: |
+        There is no real payment provider. The operation is idempotent by
+        Idempotency-Key; a replay returns the original result with the
+        Idempotent-Replay response header.
+      parameters:
+        - $ref: "#/components/parameters/WalletID"
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/DepositRequest"
+      responses:
+        "201":
+          description: Deposit committed or replayed
+          headers:
+            Idempotent-Replay:
+              description: Set to true when the key was already used for this request.
+              schema:
+                type: string
+                enum: ["true"]
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DepositResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/WalletNotFound"
+        "409":
+          $ref: "#/components/responses/IdempotencyConflict"
+        "413":
+          $ref: "#/components/responses/TooLarge"
+        "415":
+          $ref: "#/components/responses/UnsupportedMediaType"
+        "422":
+          description: Amount or balance limit violated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /api/v1/transfers:
+    post:
+      tags: [transfers]
+      summary: Transfer money between two wallets of the same currency
+      description: |
+        Both wallets must belong to the authenticated user. The operation is
+        idempotent by Idempotency-Key; a replay returns the original result
+        with the Idempotent-Replay response header.
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TransferRequest"
+      responses:
+        "201":
+          description: Transfer committed or replayed
+          headers:
+            Idempotent-Replay:
+              description: Set to true when the key was already used for this request.
+              schema:
+                type: string
+                enum: ["true"]
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TransferResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/WalletNotFound"
+        "409":
+          $ref: "#/components/responses/IdempotencyConflict"
+        "413":
+          $ref: "#/components/responses/TooLarge"
+        "415":
+          $ref: "#/components/responses/UnsupportedMediaType"
+        "422":
+          description: Insufficient funds or destination balance limit exceeded
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "500":
+          $ref: "#/components/responses/InternalError"
+    get:
+      tags: [transfers]
+      summary: List transfers visible to the caller
+      parameters:
+        - name: limit
+          in: query
+          description: Page size, 1 to 100. Defaults to 20.
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 20
+        - name: offset
+          in: query
+          description: Page offset, 0 to 1000000. Defaults to 0.
+          schema:
+            type: integer
+            minimum: 0
+            maximum: 1000000
+            default: 0
+        - name: direction
+          in: query
+          description: Filter by outgoing or incoming direction.
+          schema:
+            type: string
+            enum: [incoming, outgoing]
+        - name: currency
+          in: query
+          schema:
+            $ref: "#/components/schemas/Currency"
+      responses:
+        "200":
+          description: Transfer history page
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TransferHistoryResponse"
+        "400":
+          description: Unsupported, repeated, or invalid query parameter
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /health:
+    get:
+      tags: [operations]
+      summary: Liveness probe
+      description: Returns ok without checking dependencies.
+      security: []
+      responses:
+        "200":
+          description: Process is alive
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthResponse"
+  /ready:
+    get:
+      tags: [operations]
+      summary: Readiness probe
+      description: Pings PostgreSQL and Redis with a two second timeout.
+      security: []
+      responses:
+        "200":
+          description: Dependencies are reachable
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthResponse"
+        "503":
+          description: A dependency is unavailable
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthResponse"
+  /metrics:
+    get:
+      tags: [operations]
+      summary: Prometheus metrics for the API process
+      description: Exposition format; no authentication is applied.
+      security: []
+      responses:
+        "200":
+          description: Prometheus text exposition
+          content:
+            text/plain:
+              schema:
+                type: string
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+  parameters:
+    WalletID:
+      name: id
+      in: path
+      required: true
+      description: Wallet UUID. Must belong to the authenticated user.
+      schema:
+        type: string
+        format: uuid
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: Trimmed key, 1 to 128 bytes. Same key plus same payload means replay.
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 128
+  responses:
+    Unauthorized:
+      description: Missing or invalid bearer token
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    BadRequest:
+      description: Validation failed
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    TooLarge:
+      description: Request body exceeds the handler limit
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    UnsupportedMediaType:
+      description: Content-Type is not application/json
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    WalletNotFound:
+      description: Wallet does not exist or is not owned by the caller
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    IdempotencyConflict:
+      description: Key was used for a different request
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    InternalError:
+      description: Request could not be completed
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+  schemas:
+    Currency:
+      type: string
+      enum: [USD, EUR, JPY]
+    CredentialsRequest:
+      type: object
+      additionalProperties: false
+      required: [email, password]
+      properties:
+        email:
+          type: string
+          format: email
+          maxLength: 255
+          description: Stored and compared in lowercase.
+        password:
+          type: string
+          description: At least 12 Unicode characters and at most 1024 bytes.
+    UserInfo:
+      type: object
+      additionalProperties: false
+      required: [id, email]
+      properties:
+        id:
+          type: string
+          format: uuid
+        email:
+          type: string
+          format: email
+    AuthResponse:
+      type: object
+      additionalProperties: false
+      required: [user, access_token, token_type, expires_in]
+      properties:
+        user:
+          $ref: "#/components/schemas/UserInfo"
+        access_token:
+          type: string
+        token_type:
+          type: string
+          enum: [Bearer]
+        expires_in:
+          type: integer
+          format: int64
+          description: Token lifetime in seconds.
+    CreateWalletRequest:
+      type: object
+      additionalProperties: false
+      required: [currency]
+      properties:
+        currency:
+          $ref: "#/components/schemas/Currency"
+    Wallet:
+      type: object
+      additionalProperties: false
+      required: [id, currency, balance, created_at]
+      properties:
+        id:
+          type: string
+          format: uuid
+        currency:
+          $ref: "#/components/schemas/Currency"
+        balance:
+          type: integer
+          format: int64
+          description: Integer minor units; never negative.
+        created_at:
+          type: string
+          format: date-time
+    WalletList:
+      type: object
+      additionalProperties: false
+      required: [wallets]
+      properties:
+        wallets:
+          type: array
+          items:
+            $ref: "#/components/schemas/Wallet"
+    DepositRequest:
+      type: object
+      additionalProperties: false
+      required: [amount, currency]
+      properties:
+        amount:
+          type: integer
+          format: int64
+          minimum: 1
+          description: Positive amount in minor units.
+        currency:
+          $ref: "#/components/schemas/Currency"
+    DepositResponse:
+      type: object
+      additionalProperties: false
+      required: [transaction_id, wallet_id, amount, currency, balance, created_at]
+      properties:
+        transaction_id:
+          type: string
+          format: uuid
+        wallet_id:
+          type: string
+          format: uuid
+        amount:
+          type: integer
+          format: int64
+        currency:
+          $ref: "#/components/schemas/Currency"
+        balance:
+          type: integer
+          format: int64
+          description: Wallet balance after the deposit.
+        created_at:
+          type: string
+          format: date-time
+    TransferRequest:
+      type: object
+      additionalProperties: false
+      required: [source_wallet_id, destination_wallet_id, amount, currency]
+      properties:
+        source_wallet_id:
+          type: string
+          format: uuid
+        destination_wallet_id:
+          type: string
+          format: uuid
+        amount:
+          type: integer
+          format: int64
+          minimum: 1
+        currency:
+          $ref: "#/components/schemas/Currency"
+    TransferResponse:
+      type: object
+      additionalProperties: false
+      required:
+        - transfer_id
+        - transaction_id
+        - source_wallet_id
+        - destination_wallet_id
+        - amount
+        - currency
+        - source_balance
+        - destination_balance
+        - created_at
+      properties:
+        transfer_id:
+          type: string
+          format: uuid
+        transaction_id:
+          type: string
+          format: uuid
+          description: Same value as transfer_id in the current implementation.
+        source_wallet_id:
+          type: string
+          format: uuid
+        destination_wallet_id:
+          type: string
+          format: uuid
+        amount:
+          type: integer
+          format: int64
+        currency:
+          $ref: "#/components/schemas/Currency"
+        source_balance:
+          type: integer
+          format: int64
+          description: Source wallet balance after the transfer.
+        destination_balance:
+          type: integer
+          format: int64
+          description: Destination wallet balance after the transfer.
+        created_at:
+          type: string
+          format: date-time
+    TransferHistoryItem:
+      type: object
+      additionalProperties: false
+      required:
+        - id
+        - source_wallet_id
+        - destination_wallet_id
+        - amount
+        - currency
+        - status
+        - created_at
+      properties:
+        id:
+          type: string
+          format: uuid
+        source_wallet_id:
+          type: string
+          format: uuid
+        destination_wallet_id:
+          type: string
+          format: uuid
+        amount:
+          type: integer
+          format: int64
+        currency:
+          $ref: "#/components/schemas/Currency"
+        status:
+          type: string
+          enum: [completed]
+          description: Current implementation lists only completed transfers.
+        created_at:
+          type: string
+          format: date-time
+    TransferHistoryResponse:
+      type: object
+      additionalProperties: false
+      required: [items, limit, offset, total]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/TransferHistoryItem"
+        limit:
+          type: integer
+        offset:
+          type: integer
+        total:
+          type: integer
+          format: int64
+    HealthResponse:
+      type: object
+      additionalProperties: false
+      required: [status]
+      properties:
+        status:
+          type: string
+          enum: [ok, ready, unavailable]
+    ErrorResponse:
+      type: object
+      additionalProperties: false
+      required: [error]
+      properties:
+        error:
+          type: object
+          additionalProperties: false
+          required: [code, message]
+          properties:
+            code:
+              type: string
+              enum:
+                - unauthorized
+                - invalid_credentials
+                - invalid_request
+                - unsupported_media_type
+                - request_too_large
+                - invalid_email
+                - invalid_password
+                - email_already_registered
+                - invalid_currency
+                - wallet_already_exists
+                - wallet_not_found
+                - invalid_amount
+                - invalid_idempotency_key
+                - currency_mismatch
+                - invalid_transfer
+                - invalid_wallet_id
+                - idempotency_conflict
+                - balance_limit
+                - insufficient_funds
+                - invalid_query
+                - internal_error
+            message:
+              type: string
+security:
+  - bearerAuth: []
