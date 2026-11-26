@@ -1,8 +1,9 @@
 .env
-# Every environment variant is ignored; the two examples below are documentation.
+# Every environment variant is ignored; the examples below are documentation.
 .env.*
 !.env.example
 !.env.production.example
+!.env.k6.example
 
 # Go build and test output
 /bin/
@@ -29,3 +30,6 @@ coverage.html
 
 # Python bytecode from the dashboard validation helper
 __pycache__/
+
+# k6 reports from tests/load
+tests/load/results/
