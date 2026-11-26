@@ -1,5 +1,7 @@
  Mini Payment Processing System
 
+[![CI](https://github.com/Mopcs/mini-payment/actions/workflows/ci.yml/badge.svg)](https://github.com/Mopcs/mini-payment/actions/workflows/ci.yml)
+
 A Go modular monolith for processing payments between users. PostgreSQL is the source of truth for financial data; Redis is reserved for supporting features such as caching and rate limiting.
 
 ## Technologies
@@ -680,3 +682,120 @@ never written.
   exposed publicly.
 - There is no WAF, mTLS, or request signing. Transport security is expected to be
   terminated by a proxy in front of the API.
+
+## Continuous integration
+
+The pipeline is `.github/workflows/ci.yml` and runs on every push to `main` or
+`master` and on pull requests targeting either branch. The repository default
+branch is `master` today; `main` is listed so a rename does not silently disable
+CI.
+
+Go version: **1.26.5**, read from the `go` directive in `go.mod` with
+`go-version-file`, so the pipeline and the module can never disagree.
+
+### Jobs
+
+| Job | What it does | Services |
+| --- | --- | --- |
+| `quality` | `gofmt -l`, `go vet ./...`, `go mod tidy -diff`, repository hygiene, migration file check | none |
+| `test` | `go test -v -count=1 -timeout 10m ./...`, migration apply/rollback against a scratch database, fails if any test skipped | PostgreSQL, Redis, RabbitMQ |
+| `race` | `go test -race -count=1 -timeout 20m ./...` | PostgreSQL, Redis, RabbitMQ |
+| `docker` | Builds the `api`, `worker`, and `consumer` images; nothing is pushed | none |
+
+The workflow uses `permissions: contents: read`, and a concurrency group keyed
+on the workflow and ref, so a new push cancels the previous run.
+
+Formatting is checked, never fixed: a file that needs `gofmt` fails the job and
+the workflow does not commit anything back.
+
+### Integration tests
+
+Integration tests are gated on environment variables rather than build tags, so
+`go test ./...` runs them as soon as the infrastructure is reachable:
+
+| Variable | Used by |
+| --- | --- |
+| `TEST_DATABASE_URL` | repository, auth, wallet and transfer service tests |
+| `OUTBOX_TEST_DATABASE_URL` | outbox worker tests |
+| `CONSUMER_TEST_DATABASE_URL` | consumer tests |
+| `TEST_RABBITMQ_URL` | broker-backed worker and consumer tests |
+| `TEST_REDIS_ADDR`, `TEST_REDIS_PASSWORD` | rate limiter tests |
+
+CI starts pinned service containers (`postgres:17-alpine`, `redis:7-alpine`,
+`rabbitmq:4-management-alpine`) with health checks, creates three separate
+databases in that disposable instance, and applies migrations before running the
+tests. Credentials are CI-only values, never real ones, and the instance
+disappears with the job.
+
+Because the tests are not build-tagged, the `test` job fails if a test reports
+`--- SKIP`. That is deliberate: a skipped integration test must not look like a
+passing one.
+
+The race detector is not evidence that PostgreSQL transactions are correct. It
+catches data races in Go memory; isolation, locking, and constraint behaviour
+still have to be proven by the integration tests themselves.
+
+### Migration validation
+
+`scripts/check-migrations.sh` checks file names, `up`/`down` pairing, and
+ordering without touching a database. With `--apply` it also runs every
+migration, rolls the last one back, and re-applies it against
+`payment_migration_check`, and it refuses any database name that does not end in
+`_check` or `_test`.
+
+### Docker images
+
+One `Dockerfile` builds all three executables from the same module layer, then
+copies each static binary into `gcr.io/distroless/static-debian12:nonroot`. The
+last stage is the default target and is the API.
+
+```sh
+docker build --target api -t mini-payment-api:local .
+docker build --target worker -t mini-payment-worker:local .
+docker build --target consumer -t mini-payment-consumer:local .
+```
+
+`.dockerignore` excludes `.env`, `.git`, editor state, and build output, so a
+local secret cannot end up in an image layer. The build takes no secrets as
+arguments.
+
+### Running the same checks locally
+
+```sh
+make fmt-check          # gofmt -l over cmd and internal
+make vet                # go vet ./...
+make test               # go test ./... (integration tests skip without services)
+make test-race          # go test -race ./...
+make migrations-check   # scripts/check-migrations.sh
+make hygiene-check      # scripts/check-hygiene.sh
+make docker-build       # all three images
+make ci                 # fmt-check + vet + migrations + hygiene + test-race
+```
+
+To run the integration tests locally, start the stack, prepare the databases, and
+export the same variables CI uses:
+
+```sh
+docker compose up -d postgres redis rabbitmq
+make test-databases
+
+set -a; . ./.env; set +a
+export TEST_DATABASE_URL="postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@${POSTGRES_HOST}:${POSTGRES_PORT}/payment_db_test?sslmode=disable"
+export OUTBOX_TEST_DATABASE_URL="${TEST_DATABASE_URL/payment_db_test/payment_outbox_test}"
+export CONSUMER_TEST_DATABASE_URL="${TEST_DATABASE_URL/payment_db_test/payment_consumer_test}"
+export TEST_RABBITMQ_URL="amqp://${RABBITMQ_USER}:${RABBITMQ_PASSWORD}@${RABBITMQ_HOST:-127.0.0.1}:5672/"
+export TEST_REDIS_ADDR="${REDIS_HOST}:${REDIS_PORT}"
+export TEST_REDIS_PASSWORD="${REDIS_PASSWORD}"
+
+go test ./... -count=1
+```
+
+`make test-databases` creates `payment_db_test`, `payment_outbox_test`, and
+`payment_consumer_test` inside the Compose PostgreSQL container and applies
+migrations to each. It never touches `payment_db`.
+
+### Status
+
+The workflow was validated locally with `actionlint` and the individual commands
+were run on this machine. It has **not** been executed by GitHub Actions yet, so
+the badge shows no run until the workflow is pushed.
