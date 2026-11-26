@@ -92,6 +92,11 @@ Passwords must contain at least 12 Unicode characters and at most 1024 bytes. Th
 - `make clean` — remove containers and data volumes. This permanently deletes PostgreSQL, Redis, and RabbitMQ data.
 - `make config` — validate and print the Compose configuration.
 - `make dashboards-validate` — run every dashboard PromQL query against the running Prometheus.
+- `make compose-check` — render the production Compose file with throwaway secrets.
+- `make prod-up` — build and start the production stack from `deployments/.env.production`.
+- `make prod-down` — stop and remove the production stack.
+- `make docker-build` — build the `api`, `worker`, `consumer`, and `migrate` images.
+- `make docker-lint` — run hadolint over the `Dockerfile`.
 
 ## Database migrations
 
@@ -745,7 +750,7 @@ migration, rolls the last one back, and re-applies it against
 
 ### Docker images
 
-One `Dockerfile` builds all three executables from the same module layer, then
+One `Dockerfile` builds all four executables from the same module layer, then
 copies each static binary into `gcr.io/distroless/static-debian12:nonroot`. The
 last stage is the default target and is the API.
 
@@ -753,7 +758,12 @@ last stage is the default target and is the API.
 docker build --target api -t mini-payment-api:local .
 docker build --target worker -t mini-payment-worker:local .
 docker build --target consumer -t mini-payment-consumer:local .
+docker build --target migrate -t mini-payment-migrate:local .
 ```
+
+The `migrate` target also copies `migrations/` into the image, because the
+migrator resolves `file://migrations` against its working directory. Every image
+carries the `healthcheck` binary, since the runtime has no shell to run `curl`.
 
 `.dockerignore` excludes `.env`, `.git`, editor state, and build output, so a
 local secret cannot end up in an image layer. The build takes no secrets as
@@ -768,8 +778,9 @@ make test               # go test ./... (integration tests skip without services
 make test-race          # go test -race ./...
 make migrations-check   # scripts/check-migrations.sh
 make hygiene-check      # scripts/check-hygiene.sh
-make docker-build       # all three images
-make ci                 # fmt-check + vet + migrations + hygiene + test-race
+make docker-build       # api, worker, consumer and migrate images
+make compose-check      # render the production Compose file
+make ci                 # fmt-check + vet + migrations + hygiene + compose + test-race
 ```
 
 To run the integration tests locally, start the stack, prepare the databases, and
@@ -799,3 +810,215 @@ migrations to each. It never touches `payment_db`.
 The workflow was validated locally with `actionlint` and the individual commands
 were run on this machine. It has **not** been executed by GitHub Actions yet, so
 the badge shows no run until the workflow is pushed.
+
+## Production deployment
+
+`deployments/docker-compose.prod.yml` runs the same four processes as the
+development setup, but as containers with production defaults. The development
+file stays the way contributors expect it: infrastructure only, with ports bound
+to loopback, and the applications started from a shell.
+
+```sh
+cp deployments/.env.production.example deployments/.env.production
+# fill in the secrets, then
+make prod-up     # build and start
+make prod-down   # stop and remove
+```
+
+The file fails to render when a required secret is missing, so a half-configured
+stack cannot start:
+
+```console
+$ docker compose -f deployments/docker-compose.prod.yml config
+error while interpolating services.api.environment.JWT_SECRET:
+required variable JWT_SECRET is missing a value: Set JWT_SECRET in .env.production
+```
+
+### Services
+
+| Service    | Image target | Published port | Purpose                                  |
+| ---------- | ------------ | -------------- | ---------------------------------------- |
+| `migrate`  | `migrate`    | none           | Applies migrations once, then exits       |
+| `api`      | `api`        | `127.0.0.1:8080` | HTTP API                               |
+| `worker`   | `worker`     | none           | Outbox poller and RabbitMQ publisher      |
+| `consumer` | `consumer`   | none           | Transfer event consumer                   |
+| `postgres` | upstream     | none           | PostgreSQL 17                             |
+| `redis`    | upstream     | none           | Redis 7, rate-limit counters              |
+| `rabbitmq` | upstream     | none           | RabbitMQ 4, no management plugin port     |
+
+Only the API port is published, and by default on loopback. PostgreSQL, Redis
+and RabbitMQ are reachable only from inside the stack. The CI job asserts this:
+it renders the file and fails if a `5432`, `6379`, `5672` or `15672` port appears.
+
+`migrate` runs to completion before the applications start. Every application
+service declares `depends_on: migrate: condition: service_completed_successfully`,
+so a schema change never races a starting API:
+
+```yaml
+depends_on:
+  migrate:
+    condition: service_completed_successfully
+  redis:
+    condition: service_healthy
+```
+
+### Networks
+
+Two networks, because they answer different questions:
+
+- `backend` is `internal: true`. PostgreSQL, Redis, RabbitMQ, the worker and the
+  consumer live here, and the network has no route off the host. A compromised
+  worker cannot exfiltrate anything over the internet.
+- `edge` is routable and only the API joins it, so a reverse proxy can reach the
+  published port.
+
+A trace collector has to be attached to `backend` to be reachable; a remote OTLP
+endpoint is not, by design. Set `OTEL_TRACING_ENABLED=false` if no collector is
+deployed.
+
+### Health checks: liveness versus readiness
+
+The runtime image is distroless, so there is no shell and no `curl`. Each image
+ships a static `healthcheck` binary that performs one HTTP GET and exits
+non-zero on a non-2xx answer.
+
+| Service    | Probe                        | Answers the question                    |
+| ---------- | ---------------------------- | --------------------------------------- |
+| `api`      | `GET /ready`                 | Can this instance serve traffic now?    |
+| `worker`   | `GET :9092/metrics`          | Is the process alive and not wedged?    |
+| `consumer` | `GET :9093/metrics`          | Is the process alive and not wedged?    |
+| `postgres` | `pg_isready`                 | Accepting connections?                  |
+| `redis`    | `redis-cli ping`             | Answering commands?                     |
+| `rabbitmq` | `rabbitmq-diagnostics ping`  | Node reachable?                         |
+
+`GET /health` is the liveness endpoint: it answers as long as the process runs.
+`GET /ready` additionally pings PostgreSQL and Redis and returns `503` when
+either is unavailable. A restart policy must be driven by liveness, never by
+readiness: a database outage should not restart every API container.
+
+The worker and the consumer expose no HTTP API, so their probe targets the
+metrics listener. It proves the process is up; it cannot prove the broker is
+reachable, because a worker is expected to survive a broker outage and reconnect.
+
+### Graceful shutdown
+
+Every binary handles `SIGTERM` and `SIGINT` through `internal/shutdown`, which
+provides three things:
+
+1. `NotifyContext` cancels the root context on the first signal and releases the
+   handler, so a second signal terminates immediately instead of being swallowed
+   by a stuck shutdown.
+2. `Watchdog` logs the signal, then exits with status 1 when the shutdown budget
+   (`SHUTDOWN_TIMEOUT`, 20s by default) runs out. The process never hangs.
+3. Each process then drains in a defined order.
+
+The API:
+
+```text
+HTTP server stopped
+shutdown signal received budget=20s
+metrics server shutting down
+metrics server stopped
+flushing traces
+graceful shutdown complete
+```
+
+The signal line is written by the watchdog goroutine, so it can appear before or
+after the first drain line; the rest is ordered.
+
+`http.Server.Shutdown` stops accepting connections and waits for in-flight
+requests. A request that outlives the budget is abandoned rather than answered
+halfway.
+
+The consumer stops pulling messages, but finishes the one it is already holding
+under a context that survives cancellation:
+
+```go
+handleCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), deliveryTimeout)
+```
+
+Without that, the signal would cancel the notification transaction mid-flight
+and the message would be retried for a fault that was never its own. The message
+is acknowledged only after the transaction commits. Anything still buffered in
+the prefetch window stays unacked and returns to the queue when the channel
+closes, so the queue is never short of work after a restart.
+
+The outbox worker applies the same rule to a claimed batch: it runs under
+`context.WithoutCancel` with a 15s bound, so a half-published batch is not
+abandoned with events sitting in `in_flight` until their lease expires.
+
+| Guarantee                        | Where it comes from                              |
+| -------------------------------- | ------------------------------------------------ |
+| No message is acked before commit | `handle` acks after `Process` returns            |
+| No message is lost on shutdown   | unacked messages return to the queue             |
+| No duplicate side effect         | `notifications` table keyed by event id          |
+| No event is stranded by a stop   | batch drains, otherwise the lease expires        |
+| No hang on shutdown              | `SHUTDOWN_TIMEOUT` watchdog                      |
+
+The Compose file gives every application a `stop_grace_period` of 30s, longer
+than the 20s budget, so Docker sends `SIGKILL` only after the process has had a
+chance to stop on its own.
+
+### Container hardening
+
+| Control                 | Value                                    |
+| ----------------------- | ---------------------------------------- |
+| User                    | `nonroot` (uid 65532) from the base image |
+| Root filesystem         | `read_only: true`                         |
+| Writable paths          | `tmpfs: /tmp` only                        |
+| Capabilities            | `cap_drop: ALL`                           |
+| Privilege escalation    | `security_opt: no-new-privileges:true`    |
+| Base image              | `gcr.io/distroless/static-debian12`       |
+| Shell in the image      | none                                      |
+| Secrets in image layers | none; everything arrives as environment   |
+| Resource limits         | `deploy.resources.limits` per service     |
+| Log rotation            | `json-file`, 10 MB × 3 files              |
+
+The applications bind to port 8080 and above, so dropping every capability
+costs nothing: `NET_BIND_SERVICE` is not needed. They write no files, so a
+read-only root filesystem is enough once `/tmp` is a tmpfs.
+
+### Configuration checks in production
+
+`APP_ENV=production` switches on checks that would be noise locally and are
+dangerous in a deployment:
+
+| Variable             | Requirement in production                    |
+| -------------------- | -------------------------------------------- |
+| `JWT_SECRET`         | At least 32 bytes, not a placeholder value   |
+| `RATE_LIMIT_ENABLED` | Must be `true`                               |
+| `LOG_LEVEL`          | Must not be `debug`                          |
+| `CORS_ALLOWED_ORIGINS` | No `*` together with credentials           |
+
+A failure is reported at startup, before any port is opened:
+
+```console
+$ APP_ENV=production go run ./cmd/api
+{"level":"ERROR","msg":"load configuration","error":"RATE_LIMIT_ENABLED must be true when APP_ENV is production"}
+```
+
+### Development versus production
+
+| Concern            | `docker-compose.yml`            | `docker-compose.prod.yml`              |
+| ------------------ | ------------------------------- | -------------------------------------- |
+| Applications       | run from a shell with `go run`  | containers built from the `Dockerfile`  |
+| Infrastructure     | published on `127.0.0.1`        | not published at all                    |
+| Migrations         | `make migrate-up`               | `migrate` service, gated by `depends_on` |
+| Monitoring stack   | included                        | separate; attach to `backend`           |
+| Project name       | `mini-payment-system`           | `mini-payment-system-prod`              |
+| Data volumes       | `mini-payment-system_*`         | `mini-payment-system-prod_*`            |
+
+The project names differ on purpose: the two stacks can run side by side without
+sharing a PostgreSQL volume.
+
+### Validate the deployment files
+
+```sh
+make compose-check   # renders the production stack with throwaway secrets
+make docker-lint     # hadolint over the Dockerfile
+make docker-build    # api, worker, consumer and migrate images
+```
+
+CI runs the same checks in the `deployment` job, plus a step that asserts the
+file refuses to render when a secret is missing and one that asserts no
+infrastructure port is published.
