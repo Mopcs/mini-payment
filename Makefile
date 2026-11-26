@@ -1,6 +1,6 @@
 .PHONY: up down logs ps restart clean config migrate-up migrate-down migrate-version migrate-force \
 	dashboards-validate fmt-check vet test test-race test-databases migrations-check \
-	hygiene-check docker-build ci
+	hygiene-check compose-check docker-build docker-lint prod-up prod-down ci
 
 up:
 	docker compose up -d
@@ -80,5 +80,26 @@ docker-build:
 	docker build --target api -t mini-payment-api:local .
 	docker build --target worker -t mini-payment-worker:local .
 	docker build --target consumer -t mini-payment-consumer:local .
+	docker build --target migrate -t mini-payment-migrate:local .
 
-ci: fmt-check vet migrations-check hygiene-check test-race
+docker-lint:
+	docker run --rm -i hadolint/hadolint:2.12.0 < Dockerfile
+
+# Renders the production stack with throwaway secrets. It fails when a required
+# variable is missing, which is the point: the file must not start half
+# configured.
+compose-check:
+	@POSTGRES_PASSWORD=ci REDIS_PASSWORD=ci RABBITMQ_PASSWORD=ci \
+		JWT_SECRET=9f2a7c1e5b8d3f6a0c4e7b1d9a2f5c8e4b7d1a3f \
+		docker compose -f deployments/docker-compose.prod.yml config --quiet
+	@echo "production compose file: valid"
+
+prod-up:
+	docker compose -f deployments/docker-compose.prod.yml \
+		--env-file deployments/.env.production up -d --build
+
+prod-down:
+	docker compose -f deployments/docker-compose.prod.yml \
+		--env-file deployments/.env.production down
+
+ci: fmt-check vet migrations-check hygiene-check compose-check test-race
