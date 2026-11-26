@@ -1,14 +1,21 @@
 # Database schema
 
-The schema is defined by the numbered SQL files in `migrations/`. PostgreSQL is
-the only source of truth for financial state. No credentials or production data
-are included here.
+The schema is defined by numbered SQL files in `migrations/`. PostgreSQL is the
+only source of truth for financial state.
 
-There is **no separate `transfers` table**: a transfer is a
-`ledger_transactions` row with `transaction_type = 'transfer'`. There is also
-**no separate idempotency table**: `(user_id, idempotency_key)` and a 32-byte
-`request_hash` on `ledger_transactions` provide idempotency for both deposits
-and transfers.
+| Question | Where to look |
+| --- | --- |
+| How do the tables relate? | [Entity relationships](#entity-relationships) |
+| What is each table for? | [Table responsibilities](#table-responsibilities) |
+| What prevents invalid money? | [Important constraints](#important-constraints) |
+| Why these indexes? | [Important indexes](#important-indexes) |
+
+Two common misconceptions:
+
+- There is **no `transfers` table**. A transfer is a `ledger_transactions` row
+  with `transaction_type = 'transfer'`.
+- There is **no idempotency table**. `(user_id, idempotency_key)` plus a
+  32-byte `request_hash` on `ledger_transactions` serve deposits and transfers.
 
 ## Entity relationships
 

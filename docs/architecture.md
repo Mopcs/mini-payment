@@ -1,8 +1,17 @@
-# Architecture diagrams
+# Architecture
 
-These diagrams describe the implemented system, not a target design. The
-runtime is a modular monolith with three processes: `cmd/api`, `cmd/worker`,
-and `cmd/consumer`. All financial state lives in PostgreSQL.
+Three diagrams of the **implemented** system: the components, a transfer, and
+the outbox pipeline. There is no target-design speculation here.
+
+| Question | Where to look |
+| --- | --- |
+| What talks to what? | [System architecture](#system-architecture) |
+| How does a transfer commit? | [Transfer sequence](#transfer-sequence) |
+| How are events published and consumed? | [Outbox and RabbitMQ](#outbox-and-rabbitmq-processing) |
+
+All financial state lives in PostgreSQL. Redis holds only rate-limit counters.
+The runtime is a modular monolith with three processes: `cmd/api`, `cmd/worker`,
+and `cmd/consumer`.
 
 ## System architecture
 
