@@ -1,0 +1,26 @@
+# Keep secrets and local state out of the build context, so they can never be
+# copied into an image layer.
+.git
+.github
+.idea
+.vscode
+*.iml
+
+.env
+.env.*
+
+# Build output and local artefacts
+bin/
+build/
+*.exe
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+coverage.out
+coverage.html
+
+# Deployment configuration is not part of the Go build
+deployments/
+README.md

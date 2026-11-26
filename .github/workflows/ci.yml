@@ -1,0 +1,249 @@
+name: CI
+
+# The repository default branch is master; main is listed as well so the
+# workflow keeps working after a rename.
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+# Least privilege: the pipeline only reads the repository.
+permissions:
+  contents: read
+
+# A new push to the same branch makes the previous run irrelevant.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Integration tests are env-gated rather than build-tagged, so every job that
+  # runs them starts the services below. A missing service fails the job instead
+  # of silently skipping tests.
+  POSTGRES_HOST: 127.0.0.1
+  POSTGRES_PORT: "5432"
+  POSTGRES_USER: ci
+  POSTGRES_PASSWORD: ci-postgres-password
+  TEST_DATABASE_URL: postgres://ci:ci-postgres-password@127.0.0.1:5432/payment_db_test?sslmode=disable
+  OUTBOX_TEST_DATABASE_URL: postgres://ci:ci-postgres-password@127.0.0.1:5432/payment_outbox_test?sslmode=disable
+  CONSUMER_TEST_DATABASE_URL: postgres://ci:ci-postgres-password@127.0.0.1:5432/payment_consumer_test?sslmode=disable
+  # Deliberately no RABBITMQ_URL: the consumer test refuses to run when the
+  # test broker and the application broker are the same URL.
+  TEST_RABBITMQ_URL: amqp://ci:ci-rabbitmq-password@127.0.0.1:5672/
+  TEST_REDIS_ADDR: 127.0.0.1:6379
+  TEST_REDIS_PASSWORD: ""
+
+jobs:
+  quality:
+    name: Formatting and static analysis
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Check gofmt
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "::error::gofmt reports files that need formatting:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: Run go vet
+        run: go vet ./...
+
+      - name: Check go.mod and go.sum are tidy
+        run: go mod tidy -diff
+
+      - name: Check repository hygiene
+        run: ./scripts/check-hygiene.sh
+
+      - name: Check migration files
+        run: ./scripts/check-migrations.sh
+
+  test:
+    name: Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: ci
+          POSTGRES_PASSWORD: ci-postgres-password
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U ci -d postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+      rabbitmq:
+        image: rabbitmq:4-management-alpine
+        env:
+          RABBITMQ_DEFAULT_USER: ci
+          RABBITMQ_DEFAULT_PASS: ci-rabbitmq-password
+        ports:
+          - 5672:5672
+        options: >-
+          --health-cmd "rabbitmq-diagnostics -q ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 12
+          --health-start-period 20s
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Install PostgreSQL client
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends postgresql-client
+
+      - name: Create and migrate test databases
+        run: |
+          export PGPASSWORD="$POSTGRES_PASSWORD"
+          for db in payment_db_test payment_outbox_test payment_consumer_test payment_migration_check; do
+            psql -h "$POSTGRES_HOST" -p "$POSTGRES_PORT" -U "$POSTGRES_USER" -d postgres \
+              -v ON_ERROR_STOP=1 -c "CREATE DATABASE $db"
+          done
+          for db in payment_db_test payment_outbox_test payment_consumer_test; do
+            echo "migrating $db"
+            POSTGRES_DB="$db" go run ./cmd/migrate up
+          done
+
+      - name: Validate migrations against a scratch database
+        run: POSTGRES_DB=payment_migration_check ./scripts/check-migrations.sh --apply
+
+      - name: Run tests
+        run: |
+          set -o pipefail
+          go test -v -count=1 -timeout 10m ./... 2>&1 | tee test.log
+
+      - name: Fail when a test was skipped
+        run: |
+          if grep -q -- '--- SKIP' test.log; then
+            echo "::error::tests were skipped; CI must not silently skip tests"
+            grep -- '--- SKIP' test.log
+            exit 1
+          fi
+          echo "no tests were skipped"
+
+      - name: Upload test log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-log
+          path: test.log
+          retention-days: 7
+
+  race:
+    name: Race detector
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: ci
+          POSTGRES_PASSWORD: ci-postgres-password
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U ci -d postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+      rabbitmq:
+        image: rabbitmq:4-management-alpine
+        env:
+          RABBITMQ_DEFAULT_USER: ci
+          RABBITMQ_DEFAULT_PASS: ci-rabbitmq-password
+        ports:
+          - 5672:5672
+        options: >-
+          --health-cmd "rabbitmq-diagnostics -q ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 12
+          --health-start-period 20s
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Install PostgreSQL client
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends postgresql-client
+
+      - name: Create and migrate test databases
+        run: |
+          export PGPASSWORD="$POSTGRES_PASSWORD"
+          for db in payment_db_test payment_outbox_test payment_consumer_test; do
+            psql -h "$POSTGRES_HOST" -p "$POSTGRES_PORT" -U "$POSTGRES_USER" -d postgres \
+              -v ON_ERROR_STOP=1 -c "CREATE DATABASE $db"
+          done
+          for db in payment_db_test payment_outbox_test payment_consumer_test; do
+            POSTGRES_DB="$db" go run ./cmd/migrate up
+          done
+
+      - name: Run tests with the race detector
+        run: go test -race -count=1 -timeout 20m ./...
+
+  docker:
+    name: Docker build (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [api, worker, consumer]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      # Build only: nothing is pushed to a registry in this iteration.
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: ${{ matrix.target }}
+          push: false
+          load: false
+          cache-from: type=gha,scope=${{ matrix.target }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.target }}
