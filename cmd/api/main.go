@@ -13,6 +13,7 @@ import (
 	"github.com/Mopcs/mini-payment-system/internal/infrastructure/postgres"
 	redisinfra "github.com/Mopcs/mini-payment-system/internal/infrastructure/redis"
 	"github.com/Mopcs/mini-payment-system/internal/observability"
+	"github.com/Mopcs/mini-payment-system/internal/profiling"
 	"github.com/Mopcs/mini-payment-system/internal/ratelimit"
 	authservice "github.com/Mopcs/mini-payment-system/internal/service/auth"
 	transferservice "github.com/Mopcs/mini-payment-system/internal/service/transfer"
@@ -78,7 +79,35 @@ func run(cfg config.Config, logger *slog.Logger) error {
 	}
 	defer app.close(logger)
 
+	profiles, err := startProfiling(cfg, logger)
+	if err != nil {
+		return err
+	}
+	defer stopProfiling(profiles, logger)
+
 	return serveAPI(ctx, app.server, cfg.ShutdownTimeout, logger)
+}
+
+// startProfiling returns nil when profiling is off, which is the default. The
+// listener is separate from the API, so no public route can reach a profile.
+func startProfiling(cfg config.Config, logger *slog.Logger) (*profiling.Server, error) {
+	if !cfg.ProfilingEnabled {
+		return nil, nil
+	}
+	server, err := profiling.Start(cfg.ProfilingAddr, logger)
+	if err != nil {
+		return nil, fmt.Errorf("start profiling: %w", err)
+	}
+	return server, nil
+}
+
+func stopProfiling(server *profiling.Server, logger *slog.Logger) {
+	if server == nil {
+		return
+	}
+	if err := server.Shutdown(context.Background()); err != nil {
+		logger.Error("stop profiling", slog.Any("error", err))
+	}
 }
 
 func newRuntime(ctx context.Context, cfg config.Config, logger *slog.Logger) (*apiRuntime, error) {
