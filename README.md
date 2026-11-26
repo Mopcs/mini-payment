@@ -505,6 +505,52 @@ the shared handler.
 | Consumer trace has no link | The message was published without a `traceparent` header, which happens when the worker ran with tracing disabled. |
 | Jaeger UI is empty but spans are exported | Jaeger keeps traces in memory and restarts empty. Check the time range in the UI. |
 
+## Profiling
+
+The API can serve Go runtime profiles on a **separate, loopback-only listener**.
+It is off by default (`PROFILING_ENABLED=false`), it is never added to the
+public API mux, and the listener refuses any address that is not loopback —
+`PROFILING_ADDR=0.0.0.0:6060` and `:6060` both fail at startup. Mutex and block
+sampling is switched on with the listener and reset to zero when it stops, so a
+normally running process does not pay for it.
+
+Enable it locally while reproducing a problem:
+
+```sh
+PROFILING_ENABLED=true PROFILING_ADDR=127.0.0.1:6060 go run ./cmd/api
+```
+
+Capture profiles from the same host, then inspect them with the Go toolchain:
+
+```sh
+# CPU: run this while the slow traffic is in flight, not after it.
+curl -o cpu.pprof 'http://127.0.0.1:6060/debug/pprof/profile?seconds=30'
+go tool pprof -top -nodecount=25 cpu.pprof
+go tool pprof -list=TransferHistory cpu.pprof
+
+# Heap: live bytes by default; -alloc_space shows total allocations instead.
+curl -o heap.pprof 'http://127.0.0.1:6060/debug/pprof/heap'
+go tool pprof -top -alloc_space heap.pprof
+
+# Goroutines: debug=1 groups them, debug=2 prints every stack.
+curl 'http://127.0.0.1:6060/debug/pprof/goroutine?debug=2' > goroutines.txt
+
+# Contention: useful only after mutex/block sampling has been on for a while.
+curl -o mutex.pprof 'http://127.0.0.1:6060/debug/pprof/mutex'
+curl -o block.pprof 'http://127.0.0.1:6060/debug/pprof/block'
+go tool pprof -top mutex.pprof
+go tool pprof -top block.pprof
+```
+
+`go tool pprof -http=127.0.0.1:0 <profile>` opens a browser UI bound to a
+random loopback port; `-web` needs Graphviz installed. Read `flat` for time
+spent in a function and `cum` for time spent in it and its callees.
+
+Profiles can expose heap contents and goroutine stacks. Keep the listener on
+loopback, do not forward port 6060 through SSH or a sidecar, and turn
+`PROFILING_ENABLED` back off when the investigation ends. The measured findings
+that came from these tools are in `docs/performance-report.md`.
+
 ## Security
 
 Deposits in this project are **simulated**. There is no connection to a real
