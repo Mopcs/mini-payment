@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"math"
-	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -38,20 +37,61 @@ func NewTransferRepository(pool *pgxpool.Pool) *TransferRepository {
 	return &TransferRepository{pool: pool, outbox: NewOutboxRepository(pool)}
 }
 
-// Conditions shared by the history queries. $1 is always the user ID.
+// transferHistoryColumns is the projection every history branch shares, so the
+// column names of the union stay stable for the outer query.
+const transferHistoryColumns = `lt.id, lt.wallet_id, lt.destination_wallet_id,
+		lt.amount, lt.currency, lt.created_at`
+
+// Wallet columns a history branch can join on. These are package constants and
+// never user input: the branch builder interpolates them into the statement.
 const (
-	transferVisibleToUser = `(EXISTS (
-			SELECT 1 FROM wallets sw WHERE sw.id = lt.wallet_id AND sw.user_id = $1
-		) OR EXISTS (
-			SELECT 1 FROM wallets dw
-			WHERE dw.id = lt.destination_wallet_id AND dw.user_id = $1
-		))`
-	transferOutgoingFromUser = `EXISTS (
-		SELECT 1 FROM wallets sw WHERE sw.id = lt.wallet_id AND sw.user_id = $1)`
-	transferIncomingToUser = `EXISTS (
-		SELECT 1 FROM wallets dw
-		WHERE dw.id = lt.destination_wallet_id AND dw.user_id = $1)`
+	historySourceWallet      = "wallet_id"
+	historyDestinationWallet = "destination_wallet_id"
 )
+
+// transferHistoryBranch selects the transfers that touch the wallets of one
+// side. It joins wallets instead of testing `EXISTS` per row, because
+// `EXISTS(a) OR EXISTS(b)` is not sargable: PostgreSQL cannot use the wallet
+// indexes for it and falls back to scanning the whole table on every request.
+// The join lets the planner drive from the user's wallets into
+// ledger_transactions instead.
+func transferHistoryBranch(column string, withCurrency bool) string {
+	currency := ""
+	if withCurrency {
+		currency = " AND lt.currency = $2"
+	}
+	return `SELECT ` + transferHistoryColumns + `
+		FROM ledger_transactions lt
+		JOIN wallets w ON w.id = lt.` + column + `
+		WHERE lt.transaction_type = 'transfer' AND w.user_id = $1` + currency
+}
+
+// transferHistorySource returns the statement body shared by the count and the
+// page, so both always describe the same set of rows. A known direction needs
+// one branch; an unknown direction needs both, combined with UNION rather than
+// UNION ALL so a transfer between two wallets of the same user is listed once.
+func transferHistorySource(
+	userID uuid.UUID,
+	filter domain.TransferHistoryFilter,
+) (string, []any) {
+	args := []any{userID}
+	withCurrency := filter.Currency != ""
+	if withCurrency {
+		args = append(args, filter.Currency)
+	}
+
+	switch filter.Direction {
+	case "outgoing":
+		return transferHistoryBranch(historySourceWallet, withCurrency), args
+	case "incoming":
+		return transferHistoryBranch(historyDestinationWallet, withCurrency), args
+	default:
+		source := transferHistoryBranch(historySourceWallet, withCurrency) +
+			"\n\t\tUNION\n\t\t" +
+			transferHistoryBranch(historyDestinationWallet, withCurrency)
+		return source, args
+	}
+}
 
 func (r *TransferRepository) List(
 	ctx context.Context,
@@ -68,14 +108,14 @@ func (r *TransferRepository) List(
 	}
 	defer tx.Rollback(context.WithoutCancel(ctx))
 
-	where, args := transferHistoryWhere(userID, filter)
+	source, args := transferHistorySource(userID, filter)
 
-	total, err := countTransferHistory(ctx, tx, where, args)
+	total, err := countTransferHistory(ctx, tx, source, args)
 	if err != nil {
 		return nil, 0, err
 	}
 
-	items, err := selectTransferHistory(ctx, tx, where, args, filter)
+	items, err := selectTransferHistory(ctx, tx, source, args, filter)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -91,8 +131,8 @@ func (r *TransferRepository) Count(
 	userID uuid.UUID,
 	filter domain.TransferHistoryFilter,
 ) (int64, error) {
-	where, args := transferHistoryWhere(userID, filter)
-	return countTransferHistory(ctx, r.pool, where, args)
+	source, args := transferHistorySource(userID, filter)
+	return countTransferHistory(ctx, r.pool, source, args)
 }
 
 type transferHistoryQuery interface {
@@ -102,11 +142,12 @@ type transferHistoryQuery interface {
 func countTransferHistory(
 	ctx context.Context,
 	query transferHistoryQuery,
-	where string,
+	source string,
 	args []any,
 ) (int64, error) {
 	var total int64
-	row := query.QueryRow(ctx, `SELECT count(*) FROM ledger_transactions lt `+where, args...)
+	row := query.QueryRow(ctx,
+		`SELECT count(*) FROM (`+source+`) AS history`, args...)
 	if err := row.Scan(&total); err != nil {
 		return 0, translateError("count transfer history", err)
 	}
@@ -116,7 +157,7 @@ func countTransferHistory(
 func selectTransferHistory(
 	ctx context.Context,
 	tx pgx.Tx,
-	where string,
+	source string,
 	args []any,
 	filter domain.TransferHistoryFilter,
 ) ([]domain.TransferHistoryItem, error) {
@@ -125,12 +166,10 @@ func selectTransferHistory(
 	args = append(args, filter.Limit, filter.Offset)
 
 	rows, err := tx.Query(ctx, fmt.Sprintf(`
-		SELECT lt.id, lt.wallet_id, lt.destination_wallet_id, lt.amount,
-		       lt.currency, lt.created_at
-		FROM ledger_transactions lt
-		%s
-		ORDER BY lt.created_at DESC, lt.id DESC
-		LIMIT $%d OFFSET $%d`, where, limitArg, offsetArg), args...)
+		SELECT id, wallet_id, destination_wallet_id, amount, currency, created_at
+		FROM (%s) AS history
+		ORDER BY created_at DESC, id DESC
+		LIMIT $%d OFFSET $%d`, source, limitArg, offsetArg), args...)
 	if err != nil {
 		return nil, translateError("list transfer history", err)
 	}
@@ -152,31 +191,6 @@ func selectTransferHistory(
 		return nil, translateError("iterate transfer history", err)
 	}
 	return items, nil
-}
-
-func transferHistoryWhere(
-	userID uuid.UUID,
-	filter domain.TransferHistoryFilter,
-) (string, []any) {
-	conditions := []string{
-		"lt.transaction_type = 'transfer'",
-		transferVisibleToUser,
-	}
-	args := []any{userID}
-
-	switch filter.Direction {
-	case "outgoing":
-		conditions = append(conditions, transferOutgoingFromUser)
-	case "incoming":
-		conditions = append(conditions, transferIncomingToUser)
-	}
-
-	if filter.Currency != "" {
-		args = append(args, filter.Currency)
-		conditions = append(conditions, fmt.Sprintf("lt.currency = $%d", len(args)))
-	}
-
-	return "WHERE " + strings.Join(conditions, " AND "), args
 }
 
 // Create moves the money and queues the outbox event in one transaction, so a
