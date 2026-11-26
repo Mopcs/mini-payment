@@ -32,6 +32,14 @@ var ErrPermanent = errors.New("permanent event error")
 // maxQueueTTL is the largest x-message-ttl RabbitMQ accepts.
 const maxQueueTTL = int64(1<<31 - 1)
 
+// deliveryTimeout bounds one delivery, including the window after a shutdown
+// signal. It is long enough for a transaction and short enough that a stuck
+// handler cannot keep the process alive forever.
+const deliveryTimeout = 15 * time.Second
+
+// shutdownMessage is logged when the delivery loop stops on a signal.
+const shutdownMessage = "shutdown requested, stopping delivery loop"
+
 // Settings describes the topology the consumer expects. Everything except
 // MaxRetries has to be set; NewWithProcessor rejects the rest.
 type Settings struct {
@@ -209,24 +217,49 @@ func (c *Consumer) consumeChannels(
 	return c.consumeDeliveries(ctx, deliveries, publisher)
 }
 
+// consumeDeliveries runs the delivery loop until the context is cancelled. It
+// handles one delivery at a time, so a shutdown signal can never interrupt a
+// message that is already being processed.
 func (c *Consumer) consumeDeliveries(
 	ctx context.Context,
 	deliveries <-chan amqp091.Delivery,
-	publisher *confirmedPublisher,
+	publisher publisher,
 ) error {
 	for {
 		select {
 		case <-ctx.Done():
+			c.logger.InfoContext(ctx, shutdownMessage)
 			return nil
 		case delivery, ok := <-deliveries:
 			if !ok {
 				return errors.New("RabbitMQ delivery channel closed")
 			}
-			if err := c.handle(ctx, delivery, publisher); err != nil {
+			// A buffered delivery can win the select race against a signal.
+			// Starting it anyway would mean work this process cannot finish,
+			// so it stays unacked and is redelivered after the restart.
+			if ctx.Err() != nil {
+				c.logger.InfoContext(ctx, shutdownMessage)
+				return nil
+			}
+			if err := c.handleDelivery(ctx, delivery, publisher); err != nil {
 				return err
 			}
 		}
 	}
+}
+
+// handleDelivery processes a single delivery under a bounded context that
+// survives cancellation. Without this a shutdown signal would abort the
+// notification transaction halfway and the message would be retried even
+// though it was never at fault.
+func (c *Consumer) handleDelivery(
+	ctx context.Context,
+	delivery amqp091.Delivery,
+	publisher publisher,
+) error {
+	handleCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), deliveryTimeout)
+	defer cancel()
+	return c.handle(handleCtx, delivery, publisher)
 }
 
 func (c *Consumer) dial(ctx context.Context) (*amqp091.Connection, error) {

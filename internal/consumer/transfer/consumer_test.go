@@ -159,6 +159,87 @@ func TestHandleAcknowledgesOnlyAfterSuccessfulProcessing(t *testing.T) {
 	}
 }
 
+// shutdownProcessor blocks inside Process until the test releases it, and
+// records the state of the context it was given.
+type shutdownProcessor struct {
+	started chan struct{}
+	release chan struct{}
+	ctxErr  error
+}
+
+func (p *shutdownProcessor) Process(
+	ctx context.Context,
+	_ uuid.UUID,
+	_ string,
+	_ []byte,
+) (bool, error) {
+	close(p.started)
+	<-p.release
+	p.ctxErr = ctx.Err()
+	return false, nil
+}
+
+// A shutdown signal must not abort a message that is already being processed:
+// the handler keeps a live context and only then acknowledges.
+func TestDeliveryLoopFinishesInFlightMessageOnShutdown(t *testing.T) {
+	processor := &shutdownProcessor{started: make(chan struct{}), release: make(chan struct{})}
+	c := testConsumer(t, processor)
+	acker := &testAcknowledger{processor: &testProcessor{called: true}}
+	deliveries := make(chan amqp091.Delivery, 1)
+	deliveries <- amqp091.Delivery{
+		Acknowledger: acker,
+		DeliveryTag:  1,
+		MessageId:    uuid.NewString(),
+		Headers:      amqp091.Table{"event_type": "transfer.completed"},
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	loopDone := make(chan error, 1)
+	go func() { loopDone <- c.consumeDeliveries(ctx, deliveries, &testPublisher{}) }()
+
+	<-processor.started
+	cancel()
+	close(processor.release)
+
+	select {
+	case err := <-loopDone:
+		if err != nil {
+			t.Fatalf("delivery loop returned %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("delivery loop did not stop after shutdown")
+	}
+	if processor.ctxErr != nil {
+		t.Fatalf("in-flight delivery lost its context: %v", processor.ctxErr)
+	}
+	if !acker.acked {
+		t.Fatal("in-flight delivery was not acknowledged")
+	}
+}
+
+// A prefetched message that never started must stay unacked on shutdown.
+func TestDeliveryLoopLeavesBufferedMessagesUnacked(t *testing.T) {
+	processor := &testProcessor{}
+	c := testConsumer(t, processor)
+	acker := &testAcknowledger{processor: processor}
+	deliveries := make(chan amqp091.Delivery, 1)
+	deliveries <- amqp091.Delivery{
+		Acknowledger: acker,
+		MessageId:    uuid.NewString(),
+		Headers:      amqp091.Table{"event_type": "transfer.completed"},
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := c.consumeDeliveries(ctx, deliveries, &testPublisher{}); err != nil {
+		t.Fatal(err)
+	}
+	if acker.acked || processor.called {
+		t.Fatalf("buffered message was handled during shutdown: processed=%t acked=%t",
+			processor.called, acker.acked)
+	}
+}
+
 func TestConsumerMetricsTrackDuplicateAndFailedDeliveries(t *testing.T) {
 	registry := prometheus.NewRegistry()
 	metrics := observability.NewConsumerMetrics(registry)
