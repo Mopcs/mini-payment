@@ -1,0 +1,20 @@
+# Overlay for the load test environment.
+#
+#   docker compose \
+#     -f deployments/docker-compose.prod.yml \
+#     -f tests/load/docker-compose.load.yml \
+#     --env-file deployments/.env.production up -d --build
+#
+# It only raises the rate limits. Everything else stays as the production file
+# defines it, including the internal network, which keeps the stack unreachable
+# from the host and from the internet while a load generator runs against it.
+#
+# The budgets are raised rather than disabled so the limiter stays in the request
+# path. Rate limiting has its own tests; a load test that also measures the
+# limiter measures nothing useful.
+
+services:
+  api:
+    environment:
+      RATE_LIMIT_AUTH_LIMIT: "1000"
+      RATE_LIMIT_FINANCIAL_LIMIT: "100000"
