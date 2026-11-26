@@ -7,8 +7,6 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
-	"os/signal"
-	"syscall"
 	"time"
 
 	"github.com/Mopcs/mini-payment-system/internal/config"
@@ -19,6 +17,7 @@ import (
 	authservice "github.com/Mopcs/mini-payment-system/internal/service/auth"
 	transferservice "github.com/Mopcs/mini-payment-system/internal/service/transfer"
 	walletservice "github.com/Mopcs/mini-payment-system/internal/service/wallet"
+	"github.com/Mopcs/mini-payment-system/internal/shutdown"
 	httpserver "github.com/Mopcs/mini-payment-system/internal/transport/http"
 	"github.com/Mopcs/mini-payment-system/internal/transport/http/middleware"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -59,8 +58,11 @@ func main() {
 }
 
 func run(cfg config.Config, logger *slog.Logger) error {
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	ctx, stop := shutdown.NotifyContext()
 	defer stop()
+
+	finish := shutdown.NewWatchdog(cfg.ShutdownTimeout, logger).Start(ctx)
+	defer finish()
 
 	shutdownTracing, err := observability.StartTracing(
 		ctx, cfg.TracingSettings("mini-payment-api"), logger,
@@ -76,7 +78,7 @@ func run(cfg config.Config, logger *slog.Logger) error {
 	}
 	defer app.close(logger)
 
-	return serveAPI(ctx, app.server, logger)
+	return serveAPI(ctx, app.server, cfg.ShutdownTimeout, logger)
 }
 
 func newRuntime(ctx context.Context, cfg config.Config, logger *slog.Logger) (*apiRuntime, error) {
@@ -156,7 +158,12 @@ func (r *apiRuntime) close(logger *slog.Logger) {
 	r.pool.Close()
 }
 
-func serveAPI(ctx context.Context, server *http.Server, logger *slog.Logger) error {
+func serveAPI(
+	ctx context.Context,
+	server *http.Server,
+	shutdownTimeout time.Duration,
+	logger *slog.Logger,
+) error {
 	serverErrors := make(chan error, 1)
 	go func() {
 		logger.Info("HTTP server started", slog.String("address", server.Addr))
@@ -169,13 +176,13 @@ func serveAPI(ctx context.Context, server *http.Server, logger *slog.Logger) err
 	if err := waitForAPI(ctx, serverErrors, logger); err != nil {
 		return err
 	}
-	return shutdownAPI(server, logger)
+	return shutdownAPI(server, shutdownTimeout, logger)
 }
 
 func waitForAPI(ctx context.Context, serverErrors <-chan error, logger *slog.Logger) error {
 	select {
 	case <-ctx.Done():
-		logger.Info("shutdown signal received")
+		// The watchdog logs the signal; this records that draining started.
 		return nil
 	case err := <-serverErrors:
 		if err != nil {
@@ -185,8 +192,11 @@ func waitForAPI(ctx context.Context, serverErrors <-chan error, logger *slog.Log
 	}
 }
 
-func shutdownAPI(server *http.Server, logger *slog.Logger) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+// shutdownAPI stops accepting new connections and waits for in-flight requests
+// to finish. A request that outlives the budget is abandoned: the client sees a
+// dropped connection rather than a partial write.
+func shutdownAPI(server *http.Server, timeout time.Duration, logger *slog.Logger) error {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 	if err := server.Shutdown(ctx); err != nil {
 		logger.Error("graceful shutdown failed", slog.Any("error", err))

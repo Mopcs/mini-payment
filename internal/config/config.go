@@ -14,6 +14,7 @@ import (
 	"github.com/joho/godotenv"
 
 	"github.com/Mopcs/mini-payment-system/internal/observability"
+	"github.com/Mopcs/mini-payment-system/internal/shutdown"
 )
 
 const (
@@ -67,6 +68,7 @@ type Config struct {
 	HTTPReadTimeout              time.Duration
 	HTTPWriteTimeout             time.Duration
 	HTTPIdleTimeout              time.Duration
+	ShutdownTimeout              time.Duration
 	RateLimitEnabled             bool
 	RateLimitAuthLimit           int
 	RateLimitAuthWindow          time.Duration
@@ -115,7 +117,26 @@ func Load() (Config, error) {
 		}
 	}
 
+	if err := validateProduction(cfg); err != nil {
+		return Config{}, err
+	}
 	return cfg, nil
+}
+
+// validateProduction rejects settings that are convenient locally and unsafe in
+// production. Everything here is a documented baseline for a payment API, and
+// the message says which variable to change.
+func validateProduction(cfg Config) error {
+	if cfg.AppEnv != "production" {
+		return nil
+	}
+	if !cfg.RateLimitEnabled {
+		return errors.New("RATE_LIMIT_ENABLED must be true when APP_ENV is production")
+	}
+	if cfg.LogLevel == "debug" {
+		return errors.New("LOG_LEVEL must not be debug when APP_ENV is production")
+	}
+	return nil
 }
 
 // TracingSettings builds the tracer configuration for one process. Each binary
@@ -268,6 +289,7 @@ func loadHTTP(cfg *Config) error {
 		{"HTTP_READ_TIMEOUT", 15 * time.Second, &cfg.HTTPReadTimeout},
 		{"HTTP_WRITE_TIMEOUT", 30 * time.Second, &cfg.HTTPWriteTimeout},
 		{"HTTP_IDLE_TIMEOUT", 60 * time.Second, &cfg.HTTPIdleTimeout},
+		{"SHUTDOWN_TIMEOUT", shutdown.DefaultBudget, &cfg.ShutdownTimeout},
 	}
 
 	for _, timeout := range timeouts {

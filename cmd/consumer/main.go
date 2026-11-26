@@ -6,8 +6,6 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
-	"os/signal"
-	"syscall"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -16,6 +14,7 @@ import (
 	"github.com/Mopcs/mini-payment-system/internal/consumer/transfer"
 	"github.com/Mopcs/mini-payment-system/internal/infrastructure/postgres"
 	"github.com/Mopcs/mini-payment-system/internal/observability"
+	"github.com/Mopcs/mini-payment-system/internal/shutdown"
 )
 
 func main() {
@@ -32,8 +31,11 @@ func main() {
 }
 
 func run(cfg config.Config, logger *slog.Logger) error {
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	ctx, stop := shutdown.NotifyContext()
 	defer stop()
+
+	finish := shutdown.NewWatchdog(cfg.ShutdownTimeout, logger).Start(ctx)
+	defer finish()
 
 	shutdownTracing, err := observability.StartTracing(
 		ctx, cfg.TracingSettings("mini-payment-consumer"), logger,

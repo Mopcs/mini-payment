@@ -259,6 +259,26 @@ func TestLoadAcceptsRandomSecretInProduction(t *testing.T) {
 	}
 }
 
+func TestLoadRejectsDisabledRateLimitInProduction(t *testing.T) {
+	withRequiredSecrets(t, "9f2a7c1e5b8d3f6a0c4e7b1d9a2f5c8e4b7d1a3f")
+	t.Setenv("APP_ENV", "production")
+	t.Setenv("RATE_LIMIT_ENABLED", "false")
+
+	if _, err := Load(); err == nil {
+		t.Fatal("disabled rate limiting was accepted in production")
+	}
+}
+
+func TestLoadRejectsDebugLoggingInProduction(t *testing.T) {
+	withRequiredSecrets(t, "9f2a7c1e5b8d3f6a0c4e7b1d9a2f5c8e4b7d1a3f")
+	t.Setenv("APP_ENV", "production")
+	t.Setenv("LOG_LEVEL", "debug")
+
+	if _, err := Load(); err == nil {
+		t.Fatal("debug logging was accepted in production")
+	}
+}
+
 func TestLoadRejectsUnknownEnvironment(t *testing.T) {
 	withRequiredSecrets(t, "9f2a7c1e5b8d3f6a0c4e7b1d9a2f5c8e4b7d1a3f")
 	t.Setenv("APP_ENV", "staging")
