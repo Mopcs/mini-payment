@@ -98,12 +98,26 @@ func (w *Worker) Run(ctx context.Context) error {
 			publisher = w.connect(ctx)
 		}
 
-		if publisher != nil && w.processBatch(ctx, publisher) {
-			w.disconnect(publisher)
-			publisher = nil
+		claimed := 0
+		if publisher != nil {
+			var reconnect bool
+			reconnect, claimed = w.processBatch(ctx, publisher)
+			if reconnect {
+				w.disconnect(publisher)
+				publisher = nil
+			}
 		}
 		if ctx.Err() == nil {
 			w.updateOldestPendingAge(ctx)
+		}
+
+		// A full batch means more events are already due. Claiming the next
+		// batch now beats waiting out the poll interval: with the default batch
+		// of 20 and a poll of one second, the worker spends roughly 170ms
+		// publishing and the rest of the second idle, which caps throughput at
+		// 20 events per second while a backlog grows.
+		if claimed == w.settings.BatchSize && ctx.Err() == nil {
+			continue
 		}
 
 		select {
@@ -141,17 +155,21 @@ func (w *Worker) disconnect(publisher Publisher) {
 }
 
 // processBatch publishes one claimed batch and reports whether the connection
-// looks broken. The batch runs under a bounded context that survives
-// cancellation: a shutdown signal must not abandon a batch that is already half
-// published, because every event in it would then wait for its lease to expire.
-func (w *Worker) processBatch(ctx context.Context, publisher Publisher) (reconnect bool) {
+// looks broken, together with how many events it claimed. The batch runs under
+// a bounded context that survives cancellation: a shutdown signal must not
+// abandon a batch that is already half published, because every event in it
+// would then wait for its lease to expire.
+func (w *Worker) processBatch(
+	ctx context.Context,
+	publisher Publisher,
+) (reconnect bool, claimed int) {
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), drainTimeout)
 	defer cancel()
 
 	events, err := w.claimBatch(ctx)
 	if err != nil {
 		w.logger.ErrorContext(ctx, "claim outbox events failed", slog.Any("error", err))
-		return false
+		return false, 0
 	}
 
 	w.metrics.RecordClaimed(len(events))
@@ -162,7 +180,7 @@ func (w *Worker) processBatch(ctx context.Context, publisher Publisher) (reconne
 			reconnect = true
 		}
 	}
-	return reconnect
+	return reconnect, len(events)
 }
 
 // logClaimed records an empty poll at debug level. The worker polls once a

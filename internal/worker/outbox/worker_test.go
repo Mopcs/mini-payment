@@ -118,7 +118,7 @@ func TestWorkerSchedulesRetryAndMarksConfirmedEvent(t *testing.T) {
 	metrics := observability.NewOutboxMetrics(registry)
 	worker := newTestWorker(t, pool, publisher, 2)
 	worker.metrics = metrics
-	if reconnect := worker.processBatch(context.Background(), publisher); !reconnect {
+	if reconnect, _ := worker.processBatch(context.Background(), publisher); !reconnect {
 		t.Fatal("failed publication did not request a RabbitMQ reconnect")
 	}
 	assertOutboxState(t, pool, successfulID, func(published bool, attempts int, lockedBy *string, lastError *string, nextAttempt time.Time) {
