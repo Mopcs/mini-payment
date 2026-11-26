@@ -2,7 +2,6 @@ package postgres
 
 import (
 	"context"
-	"time"
 
 	"github.com/exaring/otelpgx"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -22,10 +21,10 @@ func NewPool(ctx context.Context, cfg config.Config) (*pgxpool.Pool, error) {
 	poolConfig.ConnConfig.Database = cfg.PostgresDB
 	poolConfig.ConnConfig.User = cfg.PostgresUser
 	poolConfig.ConnConfig.Password = cfg.PostgresPass
-	poolConfig.MaxConns = 10
-	poolConfig.MinConns = 1
-	poolConfig.MaxConnLifetime = time.Hour
-	poolConfig.MaxConnIdleTime = 30 * time.Minute
+	poolConfig.MaxConns = int32(cfg.PostgresMaxConns)
+	poolConfig.MinConns = int32(cfg.PostgresMinConns)
+	poolConfig.MaxConnLifetime = cfg.PostgresMaxConnLifetime
+	poolConfig.MaxConnIdleTime = cfg.PostgresMaxConnIdleTime
 
 	// The tracer reads the statement text but never the bind parameters, so
 	// wallet identifiers and amounts stay out of the spans.

@@ -34,9 +34,15 @@ func assertDefaultValues(t *testing.T, cfg Config) {
 		{"PostgresPort", cfg.PostgresPort, uint16(5432)},
 		{"PostgresDB", cfg.PostgresDB, "payment_db"},
 		{"PostgresUser", cfg.PostgresUser, "payment_user"},
+		{"PostgresMaxConns", cfg.PostgresMaxConns, 10},
+		{"PostgresMinConns", cfg.PostgresMinConns, 1},
+		{"PostgresMaxConnLifetime", cfg.PostgresMaxConnLifetime, time.Hour},
+		{"PostgresMaxConnIdleTime", cfg.PostgresMaxConnIdleTime, 30 * time.Minute},
 		{"RedisHost", cfg.RedisHost, "localhost"},
 		{"RedisPort", cfg.RedisPort, uint16(6379)},
 		{"LogLevel", cfg.LogLevel, "info"},
+		{"ProfilingEnabled", cfg.ProfilingEnabled, false},
+		{"ProfilingAddr", cfg.ProfilingAddr, "127.0.0.1:6060"},
 		{"JWTIssuer", cfg.JWTIssuer, "mini-payment-system"},
 		{"JWTAccessTokenTTL", cfg.JWTAccessTokenTTL, 15 * time.Minute},
 		{"RabbitMQExchange", cfg.RabbitMQExchange, "payment.events"},
@@ -235,6 +241,16 @@ func withRequiredSecrets(t *testing.T, jwtSecret string) {
 	t.Setenv("POSTGRES_PASSWORD", "postgres-test")
 	t.Setenv("REDIS_PASSWORD", "redis-test")
 	t.Setenv("JWT_SECRET", jwtSecret)
+}
+
+func TestLoadRejectsMinConnsAboveMaxConns(t *testing.T) {
+	withRequiredSecrets(t, "test-jwt-secret-with-at-least-32-bytes")
+	t.Setenv("POSTGRES_MAX_CONNS", "5")
+	t.Setenv("POSTGRES_MIN_CONNS", "6")
+
+	if _, err := Load(); err == nil {
+		t.Fatal("min conns above max conns was accepted")
+	}
 }
 
 func TestLoadRejectsPlaceholderSecretInProduction(t *testing.T) {

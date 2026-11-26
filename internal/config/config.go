@@ -30,6 +30,10 @@ type Config struct {
 	PostgresDB                   string
 	PostgresUser                 string
 	PostgresPass                 string
+	PostgresMaxConns             int
+	PostgresMinConns             int
+	PostgresMaxConnLifetime      time.Duration
+	PostgresMaxConnIdleTime      time.Duration
 	RedisHost                    string
 	RedisPort                    uint16
 	RedisPassword                string
@@ -63,6 +67,8 @@ type Config struct {
 	TracingInsecure              bool
 	TracingSampler               string
 	TracingSamplerArg            float64
+	ProfilingEnabled             bool
+	ProfilingAddr                string
 	AppEnv                       string
 	HTTPReadHeaderTimeout        time.Duration
 	HTTPReadTimeout              time.Duration
@@ -100,6 +106,7 @@ func Load() (Config, error) {
 
 	loaders := []func(*Config) error{
 		loadConnections,
+		loadPostgresPool,
 		loadLogging,
 		loadAuth,
 		loadBroker,
@@ -107,6 +114,7 @@ func Load() (Config, error) {
 		loadConsumer,
 		loadMetrics,
 		loadTracing,
+		loadProfiling,
 		loadHTTP,
 		loadRateLimit,
 		loadCORS,
@@ -242,6 +250,19 @@ func loadTracing(cfg *Config) error {
 	cfg.TracingInsecure = insecure
 	cfg.TracingSampler = sampler
 	cfg.TracingSamplerArg = ratio
+	return nil
+}
+
+// loadProfiling reads the opt-in for the pprof listener. It is off by default
+// and, when on, the address must be loopback; the profiling package enforces
+// that at bind time.
+func loadProfiling(cfg *Config) error {
+	enabled, err := boolFromEnv("PROFILING_ENABLED", false)
+	if err != nil {
+		return err
+	}
+	cfg.ProfilingEnabled = enabled
+	cfg.ProfilingAddr = trimmedEnv("PROFILING_ADDR", "127.0.0.1:6060")
 	return nil
 }
 
@@ -433,6 +454,39 @@ func loadConnections(cfg *Config) error {
 	cfg.PostgresPass = postgresPassword
 	cfg.RedisPort = redisPort
 	cfg.RedisPassword = redisPassword
+	return nil
+}
+
+// loadPostgresPool reads the pgxpool limits. The defaults are deliberately
+// small: api, worker, and consumer each open their own pool against the same
+// PostgreSQL, so the sum has to stay well under max_connections. Ten per
+// process leaves room for a second instance of each and still fits in the
+// default of one hundred.
+func loadPostgresPool(cfg *Config) error {
+	maxConns, err := intFromEnv("POSTGRES_MAX_CONNS", 10, 1, 200)
+	if err != nil {
+		return err
+	}
+	minConns, err := intFromEnv("POSTGRES_MIN_CONNS", 1, 0, 200)
+	if err != nil {
+		return err
+	}
+	if minConns > maxConns {
+		return errors.New("POSTGRES_MIN_CONNS must not exceed POSTGRES_MAX_CONNS")
+	}
+	maxLifetime, err := durationFromEnv("POSTGRES_MAX_CONN_LIFETIME", time.Hour)
+	if err != nil {
+		return err
+	}
+	maxIdle, err := durationFromEnv("POSTGRES_MAX_CONN_IDLE_TIME", 30*time.Minute)
+	if err != nil {
+		return err
+	}
+
+	cfg.PostgresMaxConns = maxConns
+	cfg.PostgresMinConns = minConns
+	cfg.PostgresMaxConnLifetime = maxLifetime
+	cfg.PostgresMaxConnIdleTime = maxIdle
 	return nil
 }
 
