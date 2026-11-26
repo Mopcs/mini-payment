@@ -1,0 +1,272 @@
+# Production topology for the payment system.
+#
+#   docker compose -f deployments/docker-compose.prod.yml --env-file .env.production up -d
+#
+# Differences from the development file in the repository root, on purpose:
+#   * no infrastructure port is published; only the API is reachable from outside
+#   * every application runs as a non-root user from a distroless image, with a
+#     read-only root filesystem, no capabilities and a tmpfs for /tmp
+#   * resource limits, log rotation and a stop grace period longer than the
+#     shutdown budget are set on every service
+#   * APP_ENV=production turns on the configuration checks that refuse
+#     placeholder secrets, debug logging and disabled rate limiting
+#
+# The project name differs from the development stack so the two never share
+# named volumes.
+
+name: mini-payment-system-prod
+
+x-app-common: &app-common
+  restart: unless-stopped
+  read_only: true
+  tmpfs:
+    # The runtime needs a writable /tmp even though the binaries write no files.
+    - /tmp
+  cap_drop:
+    - ALL
+  security_opt:
+    - no-new-privileges:true
+  # Must exceed SHUTDOWN_TIMEOUT, otherwise the orchestrator kills the process
+  # while it is still draining.
+  stop_grace_period: 30s
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "3"
+
+x-app-environment: &app-environment
+  APP_ENV: production
+  LOG_LEVEL: ${LOG_LEVEL:-info}
+  SHUTDOWN_TIMEOUT: ${SHUTDOWN_TIMEOUT:-20s}
+
+  POSTGRES_HOST: postgres
+  POSTGRES_PORT: "5432"
+  POSTGRES_DB: ${POSTGRES_DB:-payment_db}
+  POSTGRES_USER: ${POSTGRES_USER:-payment_user}
+  POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env.production}
+  # The bundled PostgreSQL serves no TLS. Terminate TLS in front of it, or point
+  # POSTGRES_HOST at a proxy that does, before removing this line.
+  PGSSLMODE: disable
+
+  REDIS_HOST: redis
+  REDIS_PORT: "6379"
+  REDIS_PASSWORD: ${REDIS_PASSWORD:?Set REDIS_PASSWORD in .env.production}
+
+  # The password is interpolated into a URL, so it must be URL safe: letters,
+  # digits, and - _ . ~ only.
+  RABBITMQ_URL: amqp://${RABBITMQ_USER:-payment_user}:${RABBITMQ_PASSWORD:?Set RABBITMQ_PASSWORD in .env.production}@rabbitmq:5672/
+
+  JWT_SECRET: ${JWT_SECRET:?Set JWT_SECRET in .env.production}
+  JWT_ISSUER: ${JWT_ISSUER:-mini-payment-system}
+
+  OTEL_TRACING_ENABLED: ${OTEL_TRACING_ENABLED:-true}
+  OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-otel-collector:4317}
+  OTEL_TRACES_SAMPLER: ${OTEL_TRACES_SAMPLER:-parentbased_traceidratio}
+  OTEL_TRACES_SAMPLER_ARG: ${OTEL_TRACES_SAMPLER_ARG:-0.1}
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-payment_db}
+      POSTGRES_USER: ${POSTGRES_USER:-payment_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env.production}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\""]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1G
+    networks:
+      - backend
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?Set REDIS_PASSWORD in .env.production}
+    command: ["sh", "-c", "exec redis-server --appendonly yes --requirepass \"$$REDIS_PASSWORD\""]
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"$$REDIS_PASSWORD\" ping | grep -q PONG"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 512M
+    networks:
+      - backend
+
+  rabbitmq:
+    image: rabbitmq:4-management
+    restart: unless-stopped
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:-payment_user}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:?Set RABBITMQ_PASSWORD in .env.production}
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      # A first boot on an empty volume creates the schema and takes close to a
+      # minute under a CPU limit. Too short a start period marks a healthy node
+      # unhealthy and blocks every service that waits for it.
+      start_period: 90s
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
+    networks:
+      - backend
+
+  migrate:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+      target: migrate
+    image: mini-payment-system-migrate:${IMAGE_TAG:-latest}
+    # One-shot: apply migrations, then exit. The application services wait for
+    # this to succeed, so a schema change can never race a starting API.
+    command: ["up"]
+    environment:
+      <<: *app-environment
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - backend
+
+  api:
+    <<: *app-common
+    build:
+      context: ..
+      dockerfile: Dockerfile
+      target: api
+    image: mini-payment-system-api:${IMAGE_TAG:-latest}
+    environment:
+      <<: *app-environment
+      APP_ADDR: ":8080"
+      API_METRICS_ADDR: "0.0.0.0:9091"
+      TRUSTED_PROXIES: ${TRUSTED_PROXIES:-}
+      CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-}
+      CORS_ALLOW_CREDENTIALS: ${CORS_ALLOW_CREDENTIALS:-false}
+    ports:
+      # Loopback by default: put a TLS-terminating proxy in front. Set
+      # API_PUBLISH_ADDR=0.0.0.0 only when the host is not directly exposed.
+      - "${API_PUBLISH_ADDR:-127.0.0.1}:${API_PORT:-8080}:8080"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/app/healthcheck", "-url", "http://127.0.0.1:8080/ready"]
+      interval: 15s
+      timeout: 5s
+      retries: 4
+      start_period: 20s
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
+    networks:
+      - backend
+      - edge
+
+  worker:
+    <<: *app-common
+    build:
+      context: ..
+      dockerfile: Dockerfile
+      target: worker
+    image: mini-payment-system-worker:${IMAGE_TAG:-latest}
+    environment:
+      <<: *app-environment
+      WORKER_METRICS_ADDR: "0.0.0.0:9092"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      rabbitmq:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/app/healthcheck", "-url", "http://127.0.0.1:9092/metrics"]
+      interval: 15s
+      timeout: 5s
+      retries: 4
+      start_period: 15s
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 256M
+    networks:
+      - backend
+
+  consumer:
+    <<: *app-common
+    build:
+      context: ..
+      dockerfile: Dockerfile
+      target: consumer
+    image: mini-payment-system-consumer:${IMAGE_TAG:-latest}
+    environment:
+      <<: *app-environment
+      CONSUMER_METRICS_ADDR: "0.0.0.0:9093"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      rabbitmq:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/app/healthcheck", "-url", "http://127.0.0.1:9093/metrics"]
+      interval: 15s
+      timeout: 5s
+      retries: 4
+      start_period: 15s
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 256M
+    networks:
+      - backend
+
+volumes:
+  postgres_data:
+  redis_data:
+  rabbitmq_data:
+
+networks:
+  # internal: true means no route to the outside world. PostgreSQL, Redis,
+  # RabbitMQ and the background workers live here and are unreachable from the
+  # host.
+  backend:
+    driver: bridge
+    internal: true
+  # The API also joins a routable network so a reverse proxy can reach it.
+  edge:
+    driver: bridge

@@ -1,4 +1,8 @@
 .env
+# Every environment variant is ignored; the two examples below are documentation.
+.env.*
+!.env.example
+!.env.production.example
 
 # Go build and test output
 /bin/
