@@ -6,6 +6,10 @@ import (
 	"time"
 )
 
+// A synthetically generated value that passes the non-placeholder check used
+// by production validation. It is not a credential and must never be deployed.
+const nonPlaceholderTestSecret = "ci-only-00000000000000000000000000000000"
+
 func TestLoadDefaults(t *testing.T) {
 	withCleanEnvironment(t)
 	t.Setenv("POSTGRES_PASSWORD", "postgres-test")
@@ -262,8 +266,8 @@ func TestLoadRejectsPlaceholderSecretInProduction(t *testing.T) {
 	}
 }
 
-func TestLoadAcceptsRandomSecretInProduction(t *testing.T) {
-	withRequiredSecrets(t, "9f2a7c1e5b8d3f6a0c4e7b1d9a2f5c8e4b7d1a3f")
+func TestLoadAcceptsNonPlaceholderSecretInProduction(t *testing.T) {
+	withRequiredSecrets(t, nonPlaceholderTestSecret)
 	t.Setenv("APP_ENV", "production")
 
 	cfg, err := Load()
@@ -276,7 +280,7 @@ func TestLoadAcceptsRandomSecretInProduction(t *testing.T) {
 }
 
 func TestLoadRejectsDisabledRateLimitInProduction(t *testing.T) {
-	withRequiredSecrets(t, "9f2a7c1e5b8d3f6a0c4e7b1d9a2f5c8e4b7d1a3f")
+	withRequiredSecrets(t, nonPlaceholderTestSecret)
 	t.Setenv("APP_ENV", "production")
 	t.Setenv("RATE_LIMIT_ENABLED", "false")
 
@@ -286,7 +290,7 @@ func TestLoadRejectsDisabledRateLimitInProduction(t *testing.T) {
 }
 
 func TestLoadRejectsDebugLoggingInProduction(t *testing.T) {
-	withRequiredSecrets(t, "9f2a7c1e5b8d3f6a0c4e7b1d9a2f5c8e4b7d1a3f")
+	withRequiredSecrets(t, nonPlaceholderTestSecret)
 	t.Setenv("APP_ENV", "production")
 	t.Setenv("LOG_LEVEL", "debug")
 
@@ -296,7 +300,7 @@ func TestLoadRejectsDebugLoggingInProduction(t *testing.T) {
 }
 
 func TestLoadRejectsUnknownEnvironment(t *testing.T) {
-	withRequiredSecrets(t, "9f2a7c1e5b8d3f6a0c4e7b1d9a2f5c8e4b7d1a3f")
+	withRequiredSecrets(t, nonPlaceholderTestSecret)
 	t.Setenv("APP_ENV", "staging")
 
 	if _, err := Load(); err == nil {
@@ -305,7 +309,7 @@ func TestLoadRejectsUnknownEnvironment(t *testing.T) {
 }
 
 func TestLoadAppliesTimeoutDefaults(t *testing.T) {
-	withRequiredSecrets(t, "9f2a7c1e5b8d3f6a0c4e7b1d9a2f5c8e4b7d1a3f")
+	withRequiredSecrets(t, nonPlaceholderTestSecret)
 
 	cfg, err := Load()
 	if err != nil {
@@ -330,7 +334,7 @@ func TestLoadAppliesTimeoutDefaults(t *testing.T) {
 }
 
 func TestLoadRejectsExcessiveTimeout(t *testing.T) {
-	withRequiredSecrets(t, "9f2a7c1e5b8d3f6a0c4e7b1d9a2f5c8e4b7d1a3f")
+	withRequiredSecrets(t, nonPlaceholderTestSecret)
 	t.Setenv("HTTP_WRITE_TIMEOUT", "10m")
 
 	if _, err := Load(); err == nil {
@@ -339,7 +343,7 @@ func TestLoadRejectsExcessiveTimeout(t *testing.T) {
 }
 
 func TestLoadRejectsReadTimeoutBelowHeaderTimeout(t *testing.T) {
-	withRequiredSecrets(t, "9f2a7c1e5b8d3f6a0c4e7b1d9a2f5c8e4b7d1a3f")
+	withRequiredSecrets(t, nonPlaceholderTestSecret)
 	t.Setenv("HTTP_READ_HEADER_TIMEOUT", "10s")
 	t.Setenv("HTTP_READ_TIMEOUT", "5s")
 
@@ -349,7 +353,7 @@ func TestLoadRejectsReadTimeoutBelowHeaderTimeout(t *testing.T) {
 }
 
 func TestLoadParsesTrustedProxies(t *testing.T) {
-	withRequiredSecrets(t, "9f2a7c1e5b8d3f6a0c4e7b1d9a2f5c8e4b7d1a3f")
+	withRequiredSecrets(t, nonPlaceholderTestSecret)
 	t.Setenv("TRUSTED_PROXIES", "10.0.0.0/8, 192.168.1.5")
 
 	cfg, err := Load()
@@ -362,7 +366,7 @@ func TestLoadParsesTrustedProxies(t *testing.T) {
 }
 
 func TestLoadRejectsInvalidTrustedProxy(t *testing.T) {
-	withRequiredSecrets(t, "9f2a7c1e5b8d3f6a0c4e7b1d9a2f5c8e4b7d1a3f")
+	withRequiredSecrets(t, nonPlaceholderTestSecret)
 	t.Setenv("TRUSTED_PROXIES", "not-an-address")
 
 	if _, err := Load(); err == nil {
@@ -371,7 +375,7 @@ func TestLoadRejectsInvalidTrustedProxy(t *testing.T) {
 }
 
 func TestLoadRejectsWildcardCORSWithCredentials(t *testing.T) {
-	withRequiredSecrets(t, "9f2a7c1e5b8d3f6a0c4e7b1d9a2f5c8e4b7d1a3f")
+	withRequiredSecrets(t, nonPlaceholderTestSecret)
 	t.Setenv("CORS_ALLOWED_ORIGINS", "*")
 	t.Setenv("CORS_ALLOW_CREDENTIALS", "true")
 
@@ -381,7 +385,7 @@ func TestLoadRejectsWildcardCORSWithCredentials(t *testing.T) {
 }
 
 func TestLoadKeepsCORSDisabledByDefault(t *testing.T) {
-	withRequiredSecrets(t, "9f2a7c1e5b8d3f6a0c4e7b1d9a2f5c8e4b7d1a3f")
+	withRequiredSecrets(t, nonPlaceholderTestSecret)
 
 	cfg, err := Load()
 	if err != nil {
@@ -393,7 +397,7 @@ func TestLoadKeepsCORSDisabledByDefault(t *testing.T) {
 }
 
 func TestLoadRejectsZeroRateLimit(t *testing.T) {
-	withRequiredSecrets(t, "9f2a7c1e5b8d3f6a0c4e7b1d9a2f5c8e4b7d1a3f")
+	withRequiredSecrets(t, nonPlaceholderTestSecret)
 	t.Setenv("RATE_LIMIT_AUTH_LIMIT", "0")
 
 	if _, err := Load(); err == nil {

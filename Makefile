@@ -90,7 +90,7 @@ docker-lint:
 # configured.
 compose-check:
 	@POSTGRES_PASSWORD=ci REDIS_PASSWORD=ci RABBITMQ_PASSWORD=ci \
-		JWT_SECRET=9f2a7c1e5b8d3f6a0c4e7b1d9a2f5c8e4b7d1a3f \
+		JWT_SECRET=ci-only-00000000000000000000000000000000 \
 		docker compose -f deployments/docker-compose.prod.yml config --quiet
 	@echo "production compose file: valid"
 

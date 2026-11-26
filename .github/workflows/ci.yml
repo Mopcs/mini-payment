@@ -268,7 +268,7 @@ jobs:
           POSTGRES_PASSWORD: ci-postgres-password
           REDIS_PASSWORD: ci-redis-password
           RABBITMQ_PASSWORD: ci-rabbitmq-password
-          JWT_SECRET: 9f2a7c1e5b8d3f6a0c4e7b1d9a2f5c8e4b7d1a3f
+          JWT_SECRET: ci-only-00000000000000000000000000000000
         run: |
           docker compose -f deployments/docker-compose.prod.yml config --quiet
           echo "production compose file renders"
@@ -287,7 +287,7 @@ jobs:
           POSTGRES_PASSWORD: ci-postgres-password
           REDIS_PASSWORD: ci-redis-password
           RABBITMQ_PASSWORD: ci-rabbitmq-password
-          JWT_SECRET: 9f2a7c1e5b8d3f6a0c4e7b1d9a2f5c8e4b7d1a3f
+          JWT_SECRET: ci-only-00000000000000000000000000000000
           GRAFANA_ADMIN_USER: ci-admin
           GRAFANA_ADMIN_PASSWORD: ci-grafana-password
         run: docker compose -f docker-compose.yml config --quiet
@@ -295,7 +295,7 @@ jobs:
       - name: Fail when infrastructure ports are published in production
         run: |
           config="$(POSTGRES_PASSWORD=x REDIS_PASSWORD=y RABBITMQ_PASSWORD=z \
-            JWT_SECRET=9f2a7c1e5b8d3f6a0c4e7b1d9a2f5c8e4b7d1a3f \
+            JWT_SECRET=ci-only-00000000000000000000000000000000 \
             docker compose -f deployments/docker-compose.prod.yml config)"
           for port in 5432 6379 5672 15672; do
             if echo "$config" | grep -q "target: $port"; then
