@@ -19,6 +19,9 @@ import (
 	"github.com/Mopcs/mini-payment-system/internal/repository/postgres"
 )
 
+// drainTimeout bounds the batch that may still run after a shutdown signal.
+const drainTimeout = 15 * time.Second
+
 type Settings struct {
 	BatchSize     int
 	PollInterval  time.Duration
@@ -99,10 +102,16 @@ func (w *Worker) Run(ctx context.Context) error {
 			w.disconnect(publisher)
 			publisher = nil
 		}
-		w.updateOldestPendingAge(ctx)
+		if ctx.Err() == nil {
+			w.updateOldestPendingAge(ctx)
+		}
 
 		select {
 		case <-ctx.Done():
+			// The batch above, if any, has finished. Nothing is left claimed by
+			// this worker, so stopping here cannot strand an event.
+			w.logger.Info("shutdown requested, outbox worker stopping",
+				slog.String("worker_id", w.workerID.String()))
 			return nil
 		case <-ticker.C:
 		}
@@ -132,21 +141,21 @@ func (w *Worker) disconnect(publisher Publisher) {
 }
 
 // processBatch publishes one claimed batch and reports whether the connection
-// looks broken.
+// looks broken. The batch runs under a bounded context that survives
+// cancellation: a shutdown signal must not abandon a batch that is already half
+// published, because every event in it would then wait for its lease to expire.
 func (w *Worker) processBatch(ctx context.Context, publisher Publisher) (reconnect bool) {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), drainTimeout)
+	defer cancel()
+
 	events, err := w.claimBatch(ctx)
 	if err != nil {
 		w.logger.ErrorContext(ctx, "claim outbox events failed", slog.Any("error", err))
 		return false
 	}
 
-	w.logger.InfoContext(
-		ctx,
-		"claimed outbox events",
-		slog.Int("count", len(events)),
-		slog.String("worker_id", w.workerID.String()),
-	)
 	w.metrics.RecordClaimed(len(events))
+	w.logClaimed(ctx, len(events))
 
 	for _, event := range events {
 		if w.publishEvent(ctx, publisher, event) {
@@ -154,6 +163,23 @@ func (w *Worker) processBatch(ctx context.Context, publisher Publisher) (reconne
 		}
 	}
 	return reconnect
+}
+
+// logClaimed records an empty poll at debug level. The worker polls once a
+// second, so logging every empty batch at info would bury everything else in
+// tens of thousands of lines a day.
+func (w *Worker) logClaimed(ctx context.Context, count int) {
+	if count == 0 {
+		w.logger.DebugContext(ctx, "claimed outbox events",
+			slog.Int("count", 0),
+			slog.String("worker_id", w.workerID.String()),
+		)
+		return
+	}
+	w.logger.InfoContext(ctx, "claimed outbox events",
+		slog.Int("count", count),
+		slog.String("worker_id", w.workerID.String()),
+	)
 }
 
 // updateOldestPendingAge keeps the backlog age fresh; it is the metric that
